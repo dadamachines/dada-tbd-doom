@@ -74,7 +74,9 @@ int main(int argc, char **argv)
     power_on_logo();
     extern void debug_show_stage(int);
     debug_show_stage(1); // Stage 1: after power_on_logo
+#if JTBD16_BOOT_DEBUG
     sleep_ms(500);
+#endif
 #if !USE_PICO_NET
     // debug ?
 //    gpio_debug_pins_init();

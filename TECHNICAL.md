@@ -93,55 +93,88 @@ Before each frame write, the GRAM pointer must be reset:
 
 ### Overview
 
-The Doom engine renders to a 320×200 8-bit paletted framebuffer. The display driver on core 1:
+The Doom engine renders at 128×64 (native OLED resolution). The display driver on core 1:
 
-1. Reads the 320×200 framebuffer (only the first 128 columns, 64 rows are visible)
+1. Reads the 128×64 8-bit paletted framebuffer
 2. Looks up each palette index → luminance via `display_palette[256]`
-3. Optionally applies a shadow-lift LUT (`remap_lut[256]`, gamma 0.625)
-4. Dithers luminance to 1-bit using blue noise thresholds
-5. Packs 8 vertical pixels into one byte (SSD1309 page format)
+3. Applies a shadow-lift LUT (`remap_lut[256]`) with configurable gamma
+4. Dithers luminance to 1-bit using the selected method
+5. Packs into SSD1309 page format (8 vertical pixels per byte)
 6. Ships the 1024-byte frame to the display via SPI
 
-### Evolution of Dithering Approaches
+### Dithering Research Framework
 
-| Approach | Result | Problem |
-|---|---|---|
-| **Original 4-plane temporal** (upstream) | Heavy flickering, brightness bands | SSD1309 has no VSYNC; async scan tears between planes of vastly different brightness |
-| **Bayer 4×4 ordered** | Stable, 17 grey levels | Visible crosshatch grid pattern at 2.4" pixel size |
-| **16×16 blue noise** (single frame) | Natural grain, no grid | Only 2 grey levels (on/off), no temporal integration |
-| **2-frame complementary blue noise** | Better: `lum > thr` and `lum > ~thr` | Still visible worm/moiré pattern from 16×16 tile repeats |
-| **4-frame phase-shifted blue noise** (current) | Best: 5 grey levels, reduced moiré | Optimal for this hardware |
+The project includes 15 compile-time switchable dithering methods for systematic A/B testing on the 128×64 SSD1309 OLED. Set `JTBD16_DITHER_MODE` in `jtbd16.h` to select:
 
-### Current Implementation: 4-Frame Phase-Shifted Blue Noise
+| Mode | Name | Method | Strengths | Weaknesses |
+|---:|---|---|---|---|
+| 0 | `DITHER_ATKINSON` | Atkinson error diffusion | Clean surfaces, sharp edges, no tile moiré | Fewer grey levels, pattern "swimming" |
+| 1 | `DITHER_BLUENOISE_STATIC` | Static blue noise threshold | Zero flicker, stable, simple | Only 2 grey levels per pixel |
+| 2 | `DITHER_BLUENOISE_TEMPORAL` | 4-frame phase-shifted blue noise | 5 grey levels, broken moiré | Slight shimmer, noisy surfaces |
+| 3 | `DITHER_3PASS_CONTRAST` | 3-pass contrast-weighted | ~7 grey levels (best gradients) | Flickers on SSD1309 (no VSYNC) |
+| 4 | `DITHER_BLUENOISE_EDGE` | Blue noise + unsharp mask | Enhanced silhouettes | Risk of halos if strength too high |
+| 5 | `DITHER_HYBRID_HUD` | Atkinson viewport + hard HUD | Crisp HUD text, smooth 3D | Visible transition at HUD boundary |
+| 6 | `DITHER_FLOYD_STEINBERG` | Floyd-Steinberg error diffusion | Most grey levels (100% error), classic | "Wormy" serpentine patterns |
+| 7 | `DITHER_SIERRA_LITE` | Sierra Lite error diffusion | Fast, nearly FS quality, less directional | Slightly fewer grey levels than FS |
+| 8 | `DITHER_BN_FLOYD_STEINBERG` | FS + blue noise threshold | FS grey levels + organic BN texture | Tuning BN_MODULATION needed |
+| 9 | `DITHER_BN_ATKINSON` | Atkinson + blue noise threshold | Clean Atkinson + BN breaks "swimming" | Tuning BN_MODULATION needed |
+| 10 | `DITHER_BAYER4X4` | Bayer 4×4 ordered | Most stable in motion, no error propagation | Visible 4×4 crosshatch grid |
+| 11 | `DITHER_BAYER8X8` | Bayer 8×8 ordered | Finer grid, 64 threshold levels | Pattern still visible but softer |
+| 12 | `DITHER_SERPENTINE_FS` | Serpentine Floyd-Steinberg | Eliminates FS directional "wormy" patterns | Slightly more complex |
+| 13 | `DITHER_JJN` | Jarvis-Judice-Ninke | Smoothest error diffusion, wide kernel | Slower (12 coefficients/pixel, /48) |
+| 14 | `DITHER_STUCKI` | Stucki error diffusion | Slightly sharper than JJN, wide kernel | Slower (12 coefficients/pixel, /42) |
 
-```c
-// Phase offsets — coprime to 16 for maximum spatial diversity
-static const uint8_t phase_dx[4] = {0, 7, 3, 11};
-static const uint8_t phase_dy[4] = {0, 3, 11,  7};
+Default: mode 0 (Atkinson). **Modes 8-9 are BN-hybrid methods**. **Modes 10-11 are ordered (Bayer)** — best for motion stability. **Modes 12-14 are advanced error diffusion**.
 
-// For each pixel, each frame samples blue_noise at a different offset:
-if (lum > blue_noise[(y + phase_dy[f]) & 15][(x + phase_dx[f]) & 15])
-    pixel = ON;
+### Tuning Parameters
+
+All parameters are `#define`s in `jtbd16.h` with `#ifndef` guards — override via build flags or by editing the header.
+
+| Parameter | Default | Range | Affects | Description |
+|---|---|---|---|---|
+| `JTBD16_DITHER_MODE` | 0 | 0-14 | All | Dithering method selection |
+| `JTBD16_SHADOW_GAMMA` | 0 | 0-3 | All | LUT gamma curve: 0=pow(0.5) aggressive, 1=pow(0.625) moderate, 2=pow(0.8) mild, 3=linear |
+| `JTBD16_DITHER_THRESHOLD` | 110 | 0-255 | 0, 1, 4-9, 12-14 | Black/white decision point. Lower = brighter output |
+| `JTBD16_EDGE_STRENGTH` | 48 | 0-128 | 4 | Unsharp mask strength for edge boost |
+| `JTBD16_HUD_Y_START` | 52 | 0-63 | 5 | First row of hard-threshold HUD region |
+| `JTBD16_HUD_THRESHOLD` | 100 | 0-255 | 5 | Threshold for HUD/status bar region |
+| `JTBD16_BN_MODULATION` | 48 | 0-128 | 8, 9 | Blue noise perturbation amplitude for hybrid modes |
+
+**Quick override example:**
 ```
-
-**Why phase offsets work:**
-- The 16×16 blue noise tile repeats every 16 pixels, which can alias with Doom's repeating wall textures (also powers of 2)
-- Shifting the sampling point by amounts coprime to 16 (7, 3, 11) means each frame's dither pattern is maximally different
-- The eye integrates all 4 → moiré appears as subtle texture rather than visible worms
-
-**Frame cycling:** At 8 MHz SPI, each frame takes ~1ms to write. All 4 frames cycle at ~250 Hz — well above the ~60 Hz flicker fusion threshold.
-
-### Blue Noise Texture
-
-Generated by `gen_blue_noise2.py` — a pure Python void-and-cluster algorithm (no scipy dependency). Parameters: 16×16 grid, sigma=1.5, seed=42. Produces 256 unique threshold values ensuring uniform distribution.
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=1 -DJTBD16_SHADOW_GAMMA=2" pio run -e doom-tbd16
+```
 
 ### Shadow-Lift LUT
 
-The `remap_lut[256]` applies a pow(0.625) gamma curve that:
-- Lifts dark values (Doom corridors are very dark)
-- Maps palette index 0-18 → 0 (true black preserved for screen edges)
-- Maps palette index 228-255 → 255 (full white for bright areas)
-- Controlled by `JTBD16_SHADOW_LIFT` define in `jtbd16.h`
+The `remap_lut[256]` applies a configurable gamma curve with black point 12 and white point 232:
+
+| Gamma | Exponent | Shadow detail | Use case |
+|---:|---|---|---|
+| 0 | pow(0.50) | Most aggressive — bright shadows | Dark corridor visibility |
+| 1 | pow(0.625) | Moderate — balanced | General play |
+| 2 | pow(0.80) | Mild — closer to original | Brighter maps |
+| 3 | linear | No gamma — just BP/WP clamping | Reference baseline |
+
+Generated by `gen_all_luts.py`. The LUT is shared across all dithering modes.
+
+### Dithering History
+
+| Approach | Result | Problem |
+|---|---|---|
+| Original 4-plane temporal (upstream) | Heavy flickering | SSD1309 no VSYNC, async scan tears |
+| Bayer 4×4 ordered | Stable, 17 grey levels | Visible crosshatch grid at 2.4" |
+| 16×16 blue noise (single frame) | Natural grain | Only 2 grey levels |
+| 2-frame complementary blue noise | Better grey levels | Worm/moiré from 16×16 tile repeats |
+| 4-frame phase-shifted blue noise | 5 grey levels | Noisy surfaces, checkerboard on walls |
+| Atkinson error diffusion | Clean surfaces, sharp edges | Too dark in corridors |
+| Floyd-Steinberg error diffusion | Most grey levels | Wormy serpentine patterns |
+| BN-modulated error diffusion | Best of ED + BN | Tuning of BN_MODULATION needed |
+| Bayer 4×4 ordered | Most stable in motion, no cascading | Visible crosshatch grid at 2.4" |
+| Bayer 8×8 ordered | Finer grid than 4×4, 64 levels | Pattern still visible but softer |
+| Serpentine Floyd-Steinberg | Eliminates FS directional bias | — |
+| JJN / Stucki | Smoothest ED, 3-row wide kernel | Division by 48/42 per pixel |
+| **Research framework (current)** | 15 methods + tunable brightness | Systematic comparison possible |
 
 ---
 
@@ -183,6 +216,126 @@ pio run -t upload
 - `idf.py flash` (wrong platform, causes boot loops on ESP-based boards)
 - `esptool.py` (ESP32 tool, not applicable to RP2350)
 
+### Command Reference
+
+All commands run from the project root.
+
+#### Build only (no flash)
+
+```bash
+# Default config (mode 0, gamma 0, threshold 110)
+pio run -e doom-tbd16
+
+# Clean build
+pio run -e doom-tbd16 -t clean && pio run -e doom-tbd16
+```
+
+#### Build and flash
+
+```bash
+# Default config
+pio run -e doom-tbd16 -t upload
+```
+
+#### Override dithering mode
+
+```bash
+# Mode 1 — static blue noise
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=1" pio run -e doom-tbd16 -t upload
+
+# Mode 2 — temporal blue noise
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=2" pio run -e doom-tbd16 -t upload
+
+# Mode 3 — 3-pass contrast
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=3" pio run -e doom-tbd16 -t upload
+
+# Mode 4 — blue noise + edge boost
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=4" pio run -e doom-tbd16 -t upload
+
+# Mode 5 — hybrid Atkinson + HUD
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=5" pio run -e doom-tbd16 -t upload
+
+# Mode 6 — Floyd-Steinberg
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=6" pio run -e doom-tbd16 -t upload
+
+# Mode 7 — Sierra Lite
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=7" pio run -e doom-tbd16 -t upload
+
+# Mode 8 — BN-modulated Floyd-Steinberg (hybrid)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=8" pio run -e doom-tbd16 -t upload
+
+# Mode 9 — BN-modulated Atkinson (hybrid)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=9" pio run -e doom-tbd16 -t upload
+
+# Mode 10 — Bayer 4×4 ordered
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=10" pio run -e doom-tbd16 -t upload
+
+# Mode 11 — Bayer 8×8 ordered
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=11" pio run -e doom-tbd16 -t upload
+
+# Mode 12 — Serpentine Floyd-Steinberg
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=12" pio run -e doom-tbd16 -t upload
+
+# Mode 13 — Jarvis-Judice-Ninke
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=13" pio run -e doom-tbd16 -t upload
+
+# Mode 14 — Stucki
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=14" pio run -e doom-tbd16 -t upload
+```
+
+#### Override gamma curve
+
+```bash
+# Gamma 0 — aggressive (pow 0.5, brightest shadows)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_SHADOW_GAMMA=0" pio run -e doom-tbd16 -t upload
+
+# Gamma 1 — moderate (pow 0.625)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_SHADOW_GAMMA=1" pio run -e doom-tbd16 -t upload
+
+# Gamma 2 — mild (pow 0.8)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_SHADOW_GAMMA=2" pio run -e doom-tbd16 -t upload
+
+# Gamma 3 — linear (no gamma, reference)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_SHADOW_GAMMA=3" pio run -e doom-tbd16 -t upload
+```
+
+#### Combined overrides
+
+```bash
+# Multiple flags — mode + gamma + threshold
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=1 -DJTBD16_SHADOW_GAMMA=2 -DJTBD16_DITHER_THRESHOLD=100" \
+  pio run -e doom-tbd16 -t upload
+
+# Mode 4 with custom edge strength
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=4 -DJTBD16_EDGE_STRENGTH=64" \
+  pio run -e doom-tbd16 -t upload
+
+# Mode 5 with custom HUD boundary
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=5 -DJTBD16_HUD_Y_START=48 -DJTBD16_HUD_THRESHOLD=90" \
+  pio run -e doom-tbd16 -t upload
+
+# Mode 8 with custom BN modulation strength
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=8 -DJTBD16_BN_MODULATION=64" \
+  pio run -e doom-tbd16 -t upload
+
+# Mode 9 with low modulation (closer to pure Atkinson)
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=9 -DJTBD16_BN_MODULATION=24" \
+  pio run -e doom-tbd16 -t upload
+```
+
+#### Regenerate gamma LUTs
+
+```bash
+python3 gen_all_luts.py > /tmp/luts.c
+# Then paste the output into i_video.c's gamma LUT section
+```
+
+#### Monitor serial output
+
+```bash
+pio device monitor -e doom-tbd16
+```
+
 ---
 
 ## 5. Memory Layout
@@ -216,17 +369,40 @@ pio run -t upload
 | 2 | Right | Turn right |
 | 3 | Up | Move forward |
 | 4 | FUNC5 (A) | Fire |
-| 5 | FUNC6 (B) | Use |
-| 6 | MASTER (X) | Run |
-| 7 | SOUND (Y) | Strafe |
-| 8 | Play | — |
-| 9 | Record | — |
-| 10 | Shift 1 | — |
-| 11 | Shift 2 | — |
+| 5 | FUNC6 (B) | Use / Open doors |
+| 6 | MASTER (X) | Strafe modifier |
+| 7 | SOUND (Y) | Run modifier |
+| 8 | Play | Menu / Pause |
+| 9 | Record | Toggle automap |
+| 10 | Shift 1 | Previous weapon |
+| 11 | Shift 2 | Next weapon |
 
 ### STM32 Reset
 
-The ESP32-P4 can reset the STM32 via GPIO40 (100ms LOW pulse). The RP2350 does not control this — it just reads I2C after the STM32 is already running.
+The RP2350 controls the STM32 reset via GPIO40 (100ms LOW pulse). The I2C bus pins and pull-ups must be configured **before** releasing STM32 from reset — otherwise the STM32 may see bus glitches during its initialization.
+
+The init sequence in `i2c_ui_init()` is:
+1. Configure GPIO38/39 as I2C1 with internal pull-ups
+2. Initialize I2C1 at 400 kHz
+3. Assert STM32 reset (GPIO40 LOW for 100ms)
+4. Release reset, wait 200ms for STM32 to boot
+5. Begin polling
+
+### Boot Debug Display
+
+The firmware includes OLED-based boot stage diagnostics (digits 0-9 on page 0, hex values on pages 1-2). These are **disabled by default** but can be re-enabled:
+
+```c
+// In jtbd16.h or via build flags:
+#define JTBD16_BOOT_DEBUG 1
+```
+
+Or via command line:
+```bash
+PLATFORMIO_BUILD_FLAGS="-DJTBD16_BOOT_DEBUG=1" pio run -e doom-tbd16 -t upload
+```
+
+The debug display shows boot progress stages 1-9 and hex checkpoint values. The functions (`debug_show_stage`, `debug_show_hex`, `debug_show_hex2`) are defined in `i_video.c` and compile to no-ops when `JTBD16_BOOT_DEBUG` is 0.
 
 ---
 
@@ -246,7 +422,8 @@ From analyzing the original TBD-16 firmware (`tbd-pico-seq3`):
 | Script | Purpose |
 |---|---|
 | `gen_blue_noise2.py` | Generate 16×16 void-and-cluster blue noise texture (pure Python, no scipy) |
-| `gen_remap_lut.py` | Generate the shadow-lift gamma LUT |
+| `gen_remap_lut.py` | Generate a single shadow-lift gamma LUT (original) |
+| `gen_all_luts.py` | Generate all 4 gamma LUT variants for the dithering framework |
 | `gen_gamma.py` | Generate gamma correction tables |
 | `gen_lut.py` | General LUT generation utilities |
 | `check_uf2.py` | Validate UF2 file structure |
@@ -260,6 +437,5 @@ From analyzing the original TBD-16 firmware (`tbd-pico-seq3`):
 
 - **Audio:** Not implemented. Sound stubs exist (`i_picosound_stub.c`) but no I2S output to the audio codec.
 - **SPI speed:** 8 MHz works, 20-30 MHz causes blank screen on current hardware. May be fixable with better SPI signal integrity or slower ramp rates.
-- **Grey levels:** 4 temporal frames give 5 levels. More frames would give more levels but the rendering loop already takes significant CPU time on core 1.
-- **Moiré:** Phase-shifted offsets reduce but don't eliminate moiré against certain Doom texture frequencies. A larger blue noise tile (32×32 or 64×64) would help but costs more flash and cache pressure.
+- **UART debug:** UART1 TX on GPIO20 is wired to the debug probe but currently produces no output despite correct initialization. Suspected physical wire disconnection on the 4th SWD cable. The 3 SWD wires (SWDIO, SWCLK, GND) work for CMSIS-DAP flashing.
 - **WAD loading:** Currently uses the embedded shareware `doom1.whx`. SD card loading would allow full Doom and custom WADs.

@@ -569,7 +569,9 @@ void D_DoomLoop (void)
     main_loop_started = true;
 
     debug_show_stage(9); // Stage 9: I_InitGraphics
+#if JTBD16_BOOT_DEBUG
     sleep_ms(2000); // hold stage 9 visible for 2 seconds
+#endif
     I_SetWindowTitle(gamedescription);
     I_GraphicsCheckCommandLine();
 #if !NO_USE_MOUSE

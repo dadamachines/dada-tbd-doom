@@ -520,6 +520,7 @@ static const uint8_t debug_digits[10][5] = {
 // Call after power_on_logo() has initialized SPI
 void debug_show_stage(int stage) {
 #if JTBD16
+    if (!JTBD16_BOOT_DEBUG) return;
     if (core1_active) return;
     // Set page 0, column 0 (command mode)
     gpio_put(J_OLED_CS, 1);
@@ -561,6 +562,7 @@ void debug_show_stage(int stage) {
 // Show a hex value on OLED page 1 (8 hex digits)
 void debug_show_hex(uint32_t val) {
 #if JTBD16
+    if (!JTBD16_BOOT_DEBUG) return;
     if (core1_active) return;
     static const uint8_t hex_font[16][3] = {
         {0x1F,0x11,0x1F},{0x00,0x1F,0x00},{0x1D,0x15,0x17},{0x15,0x15,0x1F},
@@ -594,6 +596,7 @@ void debug_show_hex(uint32_t val) {
 // Show hex on page 2
 void debug_show_hex2(uint32_t val) {
 #if JTBD16
+    if (!JTBD16_BOOT_DEBUG) return;
     if (core1_active) return;
     static const uint8_t hex_font[16][3] = {
         {0x1F,0x11,0x1F},{0x00,0x1F,0x00},{0x1D,0x15,0x17},{0x15,0x15,0x1F},
@@ -1049,61 +1052,229 @@ static void core1() {
 #if defined J_OLED_MONO
 
 #if JTBD16
-        // =========================================================
-        // SSD1309 128x64: 4-frame phase-shifted blue noise dithering
-        // =========================================================
-        // 4 temporal frames, each sampling the blue noise texture at
-        // a different spatial offset. This achieves:
-        //  - 5 effective grey levels per pixel (0/4 .. 4/4)
-        //  - Breaks 16×16 tile moiré by shifting the pattern
-        //  - At 30MHz SPI: ~0.27ms per frame → ~900Hz cycle rate
-        //  - All frames have similar average brightness → no flicker
-        {
-            static const uint8_t blue_noise[16][16] = {
-                {114,   5,  74, 207,  37, 222,  71,   2,  83,  21, 225, 135,  24, 152, 199, 179},
-                { 63, 194, 136,  15,  90, 192, 138, 162, 205, 180,  26,  27, 214,  97, 131,  35},
-                {164, 224, 106, 247, 153, 120,  48, 243, 111,  13, 251, 163,   4, 232,  78, 253},
-                { 29,  84,  46, 176,  59, 210,  30,  96,  62, 146, 124,  91, 184, 118,  43, 142},
-                {183, 216, 129,   8, 233,  81, 169, 226, 187, 218,  75, 206,  54, 151, 209, 102},
-                { 52, 155,  73, 191, 143, 108,  42, 132,   6,  22, 172,  38, 242,  69,  11, 230},
-                { 92,  33, 244,  99,  16, 203, 240,  67, 157, 248, 103, 139, 115, 190, 165, 122},
-                {201, 173,  58, 223, 161,  55, 182, 119,  94, 198,  51, 228,   1,  85,  19, 249},
-                { 39, 141, 116,   0, 128,  86,  20, 221,  10, 145,  79, 168, 200, 220, 133,  65},
-                {195, 236,  76, 213, 188, 254, 148, 174,  60, 235, 125,  34,  98,  44, 160, 105},
-                { 12,  95, 159,  40, 100,  23,  72, 112, 211,  41, 186, 255, 150,  57, 238, 181},
-                { 25, 217,  53, 177, 134, 227, 202,  14,  89, 158,  70,  28, 110, 215,  82, 126},
-                {252, 144, 109, 237,  66,   7, 166, 140, 245, 117, 219, 137, 197,  36, 171,   3},
-                {185,  68, 204,  32, 196, 123,  80, 189,  50,  31, 178,  45,  77, 231, 147, 101},
-                { 17, 127,  47,  88, 149, 250,  18, 104, 208,  64, 239,  93, 167, 121,  61, 212},
-                {229, 156, 241, 170, 113,  56, 175, 234, 130, 154, 107, 193,   9, 246,  49,  87},
-            };
 
-            // Phase offsets — coprime to 16 to maximise spatial diversity
+#if JTBD16_SHADOW_GAMMA == 0
+        // pow(0.50) — aggressive shadow lift, bp=12, wp=232
+        static const uint8_t remap_lut[256] = {
+              0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  17,  24,  30,
+             34,  38,  42,  45,  49,  52,  54,  57,  60,  62,  64,  67,  69,  71,  73,  75,
+             77,  79,  81,  82,  84,  86,  88,  89,  91,  93,  94,  96,  97,  99, 100, 102,
+            103, 105, 106, 107, 109, 110, 111, 113, 114, 115, 117, 118, 119, 120, 122, 123,
+            124, 125, 126, 128, 129, 130, 131, 132, 133, 134, 135, 136, 138, 139, 140, 141,
+            142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157,
+            158, 159, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 168, 169, 170, 171,
+            172, 173, 174, 174, 175, 176, 177, 178, 179, 179, 180, 181, 182, 183, 184, 184,
+            185, 186, 187, 188, 188, 189, 190, 191, 191, 192, 193, 194, 195, 195, 196, 197,
+            198, 198, 199, 200, 200, 201, 202, 203, 203, 204, 205, 206, 206, 207, 208, 208,
+            209, 210, 211, 211, 212, 213, 213, 214, 215, 215, 216, 217, 217, 218, 219, 219,
+            220, 221, 222, 222, 223, 223, 224, 225, 225, 226, 227, 227, 228, 229, 229, 230,
+            231, 231, 232, 233, 233, 234, 234, 235, 236, 236, 237, 238, 238, 239, 239, 240,
+            241, 241, 242, 243, 243, 244, 244, 245, 246, 246, 247, 247, 248, 249, 249, 250,
+            250, 251, 251, 252, 253, 253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        };
+#elif JTBD16_SHADOW_GAMMA == 1
+        // pow(0.625) — moderate shadow lift, bp=12, wp=232
+        static const uint8_t remap_lut[256] = {
+              0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   9,  14,  17,
+             21,  24,  27,  30,  32,  35,  37,  39,  41,  44,  46,  48,  50,  51,  53,  55,
+             57,  59,  60,  62,  64,  65,  67,  69,  70,  72,  73,  75,  76,  78,  79,  81,
+             82,  84,  85,  86,  88,  89,  91,  92,  93,  95,  96,  97,  98, 100, 101, 102,
+            104, 105, 106, 107, 108, 110, 111, 112, 113, 114, 116, 117, 118, 119, 120, 121,
+            122, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 163, 164, 165, 166, 167, 168, 169, 170,
+            171, 172, 173, 174, 175, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 184,
+            185, 186, 187, 188, 189, 190, 191, 191, 192, 193, 194, 195, 196, 197, 197, 198,
+            199, 200, 201, 202, 202, 203, 204, 205, 206, 207, 207, 208, 209, 210, 211, 211,
+            212, 213, 214, 215, 215, 216, 217, 218, 219, 219, 220, 221, 222, 223, 223, 224,
+            225, 226, 227, 227, 228, 229, 230, 230, 231, 232, 233, 233, 234, 235, 236, 236,
+            237, 238, 239, 240, 240, 241, 242, 242, 243, 244, 245, 245, 246, 247, 248, 248,
+            249, 250, 251, 251, 252, 253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        };
+#elif JTBD16_SHADOW_GAMMA == 2
+        // pow(0.80) — mild shadow lift, bp=12, wp=232
+        static const uint8_t remap_lut[256] = {
+              0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   6,   8,
+             10,  12,  14,  16,  18,  20,  22,  23,  25,  27,  28,  30,  31,  33,  34,  36,
+             37,  39,  40,  42,  43,  45,  46,  48,  49,  50,  52,  53,  55,  56,  57,  59,
+             60,  61,  63,  64,  65,  67,  68,  69,  70,  72,  73,  74,  75,  77,  78,  79,
+             80,  82,  83,  84,  85,  87,  88,  89,  90,  91,  93,  94,  95,  96,  97,  99,
+            100, 101, 102, 103, 104, 106, 107, 108, 109, 110, 111, 112, 114, 115, 116, 117,
+            118, 119, 120, 121, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 134, 135,
+            136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 148, 149, 150, 151, 152,
+            153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168,
+            169, 170, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185,
+            186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201,
+            202, 203, 204, 205, 206, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
+            217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
+            232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247,
+            248, 248, 249, 250, 251, 252, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        };
+#elif JTBD16_SHADOW_GAMMA == 3
+        // linear — black/white point only, bp=12, wp=232
+        static const uint8_t remap_lut[256] = {
+              0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   2,   3,
+              5,   6,   7,   8,   9,  10,  12,  13,  14,  15,  16,  17,  19,  20,  21,  22,
+             23,  24,  26,  27,  28,  29,  30,  31,  32,  34,  35,  36,  37,  38,  39,  41,
+             42,  43,  44,  45,  46,  48,  49,  50,  51,  52,  53,  54,  56,  57,  58,  59,
+             60,  61,  63,  64,  65,  66,  67,  68,  70,  71,  72,  73,  74,  75,  77,  78,
+             79,  80,  81,  82,  83,  85,  86,  87,  88,  89,  90,  92,  93,  94,  95,  96,
+             97,  99, 100, 101, 102, 103, 104, 105, 107, 108, 109, 110, 111, 112, 114, 115,
+            116, 117, 118, 119, 121, 122, 123, 124, 125, 126, 128, 129, 130, 131, 132, 133,
+            134, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 150, 151, 152,
+            153, 154, 155, 156, 158, 159, 160, 161, 162, 163, 165, 166, 167, 168, 169, 170,
+            172, 173, 174, 175, 176, 177, 179, 180, 181, 182, 183, 184, 185, 187, 188, 189,
+            190, 191, 192, 194, 195, 196, 197, 198, 199, 201, 202, 203, 204, 205, 206, 207,
+            209, 210, 211, 212, 213, 214, 216, 217, 218, 219, 220, 221, 223, 224, 225, 226,
+            227, 228, 230, 231, 232, 233, 234, 235, 236, 238, 239, 240, 241, 242, 243, 245,
+            246, 247, 248, 249, 250, 252, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        };
+#else
+#error "JTBD16_SHADOW_GAMMA must be 0-3"
+#endif
+
+        // Blue noise texture — shared by modes 1, 2, 4
+        static const uint8_t blue_noise[16][16] = {
+            {114,   5,  74, 207,  37, 222,  71,   2,  83,  21, 225, 135,  24, 152, 199, 179},
+            { 63, 194, 136,  15,  90, 192, 138, 162, 205, 180,  26,  27, 214,  97, 131,  35},
+            {164, 224, 106, 247, 153, 120,  48, 243, 111,  13, 251, 163,   4, 232,  78, 253},
+            { 29,  84,  46, 176,  59, 210,  30,  96,  62, 146, 124,  91, 184, 118,  43, 142},
+            {183, 216, 129,   8, 233,  81, 169, 226, 187, 218,  75, 206,  54, 151, 209, 102},
+            { 52, 155,  73, 191, 143, 108,  42, 132,   6,  22, 172,  38, 242,  69,  11, 230},
+            { 92,  33, 244,  99,  16, 203, 240,  67, 157, 248, 103, 139, 115, 190, 165, 122},
+            {201, 173,  58, 223, 161,  55, 182, 119,  94, 198,  51, 228,   1,  85,  19, 249},
+            { 39, 141, 116,   0, 128,  86,  20, 221,  10, 145,  79, 168, 200, 220, 133,  65},
+            {195, 236,  76, 213, 188, 254, 148, 174,  60, 235, 125,  34,  98,  44, 160, 105},
+            { 12,  95, 159,  40, 100,  23,  72, 112, 211,  41, 186, 255, 150,  57, 238, 181},
+            { 25, 217,  53, 177, 134, 227, 202,  14,  89, 158,  70,  28, 110, 215,  82, 126},
+            {252, 144, 109, 237,  66,   7, 166, 140, 245, 117, 219, 137, 197,  36, 171,   3},
+            {185,  68, 204,  32, 196, 123,  80, 189,  50,  31, 178,  45,  77, 231, 147, 101},
+            { 17, 127,  47,  88, 149, 250,  18, 104, 208,  64, 239,  93, 167, 121,  61, 212},
+            {229, 156, 241, 170, 113,  56, 175, 234, 130, 154, 107, 193,   9, 246,  49,  87},
+        };
+
+        // Helper macro: look up luminance through remap LUT
+        #define LUM_AT(fb, y, x) remap_lut[display_palette[(fb)[(y) * SCREENWIDTH + (x)]]]
+
+#if JTBD16_DITHER_MODE == DITHER_ATKINSON
+        // =========================================================
+        // Mode 0: Atkinson error-diffusion dithering
+        // =========================================================
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_buf[3][DISPLAYWIDTH];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_buf, 0, sizeof(err_buf));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+                    int er   = sy % 3;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_buf[er][sx];
+                        int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                        int qe  = (val - out) >> 3;
+
+                        if (sx + 1 < DISPLAYWIDTH) err_buf[er][sx + 1] += qe;
+                        if (sx + 2 < DISPLAYWIDTH) err_buf[er][sx + 2] += qe;
+                        if (sy + 1 < DISPLAYHEIGHT) {
+                            int r1 = (sy + 1) % 3;
+                            if (sx > 0)                err_buf[r1][sx - 1] += qe;
+                                                       err_buf[r1][sx]     += qe;
+                            if (sx + 1 < DISPLAYWIDTH) err_buf[r1][sx + 1] += qe;
+                        }
+                        if (sy + 2 < DISPLAYHEIGHT) {
+                            err_buf[(sy + 2) % 3][sx] += qe;
+                        }
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memset(err_buf[er], 0, DISPLAYWIDTH * sizeof(int16_t));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BLUENOISE_STATIC
+        // =========================================================
+        // Mode 1: Static blue noise ordered dithering
+        // =========================================================
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
+                    for (int x = 0; x < DISPLAYWIDTH; x++) {
+                        uint8_t col = 0;
+                        for (int b = 0; b < 8; b++) {
+                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            uint lum = LUM_AT(fb, y, x);
+                            col >>= 1;
+                            if (lum > blue_noise[y & 15][x & 15]) col |= 0x80;
+                        }
+                        frame[p * DISPLAYWIDTH + x] = col;
+                    }
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BLUENOISE_TEMPORAL
+        // =========================================================
+        // Mode 2: 4-frame phase-shifted blue noise dithering
+        // =========================================================
+        {
             static const uint8_t phase_dx[4] = {0, 7, 3, 11};
             static const uint8_t phase_dy[4] = {0, 3, 11,  7};
 
-#if JTBD16_SHADOW_LIFT
-            static const uint8_t remap_lut[256] = {
-                  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
-                  0,   0,   0,   9,  14,  18,  21,  24,  27,  30,  33,  35,  38,  40,  42,  44,
-                 46,  48,  50,  52,  54,  56,  58,  60,  62,  63,  65,  67,  68,  70,  72,  73,
-                 75,  76,  78,  79,  81,  82,  84,  85,  87,  88,  89,  91,  92,  94,  95,  96,
-                 98,  99, 100, 101, 103, 104, 105, 107, 108, 109, 110, 112, 113, 114, 115, 116,
-                118, 119, 120, 121, 122, 123, 125, 126, 127, 128, 129, 130, 131, 132, 134, 135,
-                136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151,
-                152, 154, 155, 156, 157, 158, 159, 159, 160, 161, 162, 163, 164, 165, 166, 167,
-                168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 179, 180, 181, 182,
-                183, 184, 185, 186, 187, 188, 189, 189, 190, 191, 192, 193, 194, 195, 196, 196,
-                197, 198, 199, 200, 201, 202, 203, 203, 204, 205, 206, 207, 208, 208, 209, 210,
-                211, 212, 213, 213, 214, 215, 216, 217, 218, 218, 219, 220, 221, 222, 222, 223,
-                224, 225, 226, 226, 227, 228, 229, 230, 230, 231, 232, 233, 234, 234, 235, 236,
-                237, 238, 238, 239, 240, 241, 241, 242, 243, 244, 244, 245, 246, 247, 247, 248,
-                249, 250, 251, 251, 252, 253, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255,
-                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            };
-#endif
-
-            // 4 frame buffers for phase-shifted temporal dithering
             static uint8_t frames[4][DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
 
             sem_acquire_blocking(&vsync);
@@ -1112,18 +1283,12 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
-                // Render 4 blue-noise frames, each offset by a different phase.
-                // Eye integrates all 4 → 5 grey levels per pixel, moiré broken.
                 for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
                     for (int x = 0; x < DISPLAYWIDTH; x++) {
                         uint8_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                         for (int b = 0; b < 8; b++) {
                             int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
-#if JTBD16_SHADOW_LIFT
-                            uint lum = remap_lut[display_palette[fb[y * SCREENWIDTH + x]]];
-#else
-                            uint lum = display_palette[fb[y * SCREENWIDTH + x]];
-#endif
+                            uint lum = LUM_AT(fb, y, x);
                             c0 >>= 1; c1 >>= 1; c2 >>= 1; c3 >>= 1;
                             if (lum > blue_noise[(y             ) & 15][(x             ) & 15]) c0 |= 0x80;
                             if (lum > blue_noise[(y + phase_dy[1]) & 15][(x + phase_dx[1]) & 15]) c1 |= 0x80;
@@ -1140,8 +1305,6 @@ static void core1() {
 
                 sem_release(&vsync);
 
-                // Cycle all 4 frames until next game tick.
-                // At 30MHz SPI: ~0.27ms per 1024-byte frame → ~900Hz.
                 do {
                     for (int f = 0; f < 4; f++) {
                         gpio_put(J_OLED_CS, 0);
@@ -1158,8 +1321,857 @@ static void core1() {
             }
         }
 
+#elif JTBD16_DITHER_MODE == DITHER_3PASS_CONTRAST
+        // =========================================================
+        // Mode 3: 3-pass contrast-weighted greyscale
+        // =========================================================
+        // Original rp2040-doom technique. ~7 grey levels.
+        // Known to flicker on SSD1309 128x64.
+        {
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+
+                for (uint pass = 0; pass < 3; pass++) {
+                    uint8_t level = 0x04 >> pass;
+                    uint d = dither;
+
+                    for (int p = 0; p < (DISPLAYHEIGHT / 8); ++p) {
+                        for (int x = 0; x < DISPLAYWIDTH; ++x) {
+                            d ^= 1;
+                            uint8_t byte = 0;
+                            for (int b = 0; b < 8; ++b) {
+                                d ^= 1;
+                                int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                                uint lum = remap_lut[display_palette[frame_buffer[display_frame_index][y * SCREENWIDTH + x]]];
+                                lum = (lum >> 5) + ((lum >> 4) & d);
+                                if (lum > 7) lum = 7;
+                                byte >>= 1;
+                                if (lum & level) {
+                                    byte |= 0x80;
+                                }
+                            }
+                            field_buffer[p * DISPLAYWIDTH + x] = byte;
+                        }
+                    }
+
+                    command_run[1] = contrast[pass];
+
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, field_buffer, sizeof(field_buffer));
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_run, sizeof(command_run));
+                    gpio_put(J_OLED_CS, 1);
+                }
+
+                dither ^= 1;
+                sem_release(&vsync);
+
+                frame_time = delayed_by_us(frame_time, FRAME_PERIOD);
+                sleep_until(frame_time);
+
+                __dmb();
+                if (*(volatile uint8_t *)&display_frame_index != last_fi) {
+                    // New frame available
+                }
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BLUENOISE_EDGE
+        // =========================================================
+        // Mode 4: Blue noise + edge boost (unsharp mask)
+        // =========================================================
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static uint8_t lum_prev[DISPLAYWIDTH];
+            static uint8_t lum_curr[DISPLAYWIDTH];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+
+                // Pre-fill first row
+                {
+                    int fb_y = (DISPLAYHEIGHT - 1) - 0;
+                    for (int x = 0; x < DISPLAYWIDTH; x++)
+                        lum_prev[x] = LUM_AT(fb, fb_y, x);
+                }
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+
+                    for (int x = 0; x < DISPLAYWIDTH; x++)
+                        lum_curr[x] = LUM_AT(fb, fb_y, x);
+
+                    int fb_y_next = (sy + 1 < DISPLAYHEIGHT) ? (DISPLAYHEIGHT - 1) - (sy + 1) : fb_y;
+
+                    for (int x = 0; x < DISPLAYWIDTH; x++) {
+                        int c = lum_curr[x];
+                        int left  = (x > 0) ? lum_curr[x - 1] : c;
+                        int right = (x + 1 < DISPLAYWIDTH) ? lum_curr[x + 1] : c;
+                        int up    = lum_prev[x];
+                        int down  = LUM_AT(fb, fb_y_next, x);
+
+                        int mean = (c * 4 + left + right + up + down) >> 3;
+                        int boosted = c + (((c - mean) * JTBD16_EDGE_STRENGTH) >> 7);
+                        if (boosted < 0) boosted = 0;
+                        if (boosted > 255) boosted = 255;
+
+                        if (boosted > blue_noise[sy & 15][x & 15]) {
+                            frame[page * DISPLAYWIDTH + x] |= (1 << bit);
+                        }
+                    }
+
+                    memcpy(lum_prev, lum_curr, DISPLAYWIDTH);
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_HYBRID_HUD
+        // =========================================================
+        // Mode 5: Hybrid Atkinson viewport + hard-threshold HUD
+        // =========================================================
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_buf[3][DISPLAYWIDTH];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_buf, 0, sizeof(err_buf));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+
+                    if (sy < JTBD16_HUD_Y_START) {
+                        // --- Atkinson region (3D viewport) ---
+                        int er = sy % 3;
+                        for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                            int lum = LUM_AT(fb, fb_y, sx);
+                            int val = lum + err_buf[er][sx];
+                            int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                            int qe  = (val - out) >> 3;
+
+                            if (sx + 1 < DISPLAYWIDTH) err_buf[er][sx + 1] += qe;
+                            if (sx + 2 < DISPLAYWIDTH) err_buf[er][sx + 2] += qe;
+                            if (sy + 1 < DISPLAYHEIGHT && sy + 1 < JTBD16_HUD_Y_START) {
+                                int r1 = (sy + 1) % 3;
+                                if (sx > 0)                err_buf[r1][sx - 1] += qe;
+                                                           err_buf[r1][sx]     += qe;
+                                if (sx + 1 < DISPLAYWIDTH) err_buf[r1][sx + 1] += qe;
+                            }
+                            if (sy + 2 < DISPLAYHEIGHT && sy + 2 < JTBD16_HUD_Y_START) {
+                                err_buf[(sy + 2) % 3][sx] += qe;
+                            }
+
+                            if (out) {
+                                frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                            }
+                        }
+                        memset(err_buf[er], 0, DISPLAYWIDTH * sizeof(int16_t));
+                    } else {
+                        // --- Hard threshold region (HUD/status bar) ---
+                        for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                            int lum = LUM_AT(fb, fb_y, sx);
+                            if (lum > JTBD16_HUD_THRESHOLD) {
+                                frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                            }
+                        }
+                    }
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_FLOYD_STEINBERG
+        // =========================================================
+        // Mode 6: Floyd-Steinberg error-diffusion dithering
+        // =========================================================
+        // Classic full error diffusion: distributes 100% of quantization
+        // error to 4 neighbours (7/16, 3/16, 5/16, 1/16).
+        // More grey levels than Atkinson but can produce "wormy" patterns.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_curr[DISPLAYWIDTH + 2];
+            static int16_t err_next[DISPLAYWIDTH + 2];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_curr, 0, sizeof(err_curr));
+                memset(err_next, 0, sizeof(err_next));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_curr[sx + 1];
+                        int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                        int qe  = val - out;
+
+                        // Floyd-Steinberg error distribution (7/16, 3/16, 5/16, 1/16)
+                        err_curr[sx + 2] += (qe * 7) >> 4;
+                        err_next[sx]     += (qe * 3) >> 4;
+                        err_next[sx + 1] += (qe * 5) >> 4;
+                        err_next[sx + 2] += (qe * 1) >> 4;
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memcpy(err_curr, err_next, sizeof(err_curr));
+                    memset(err_next, 0, sizeof(err_next));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_SIERRA_LITE
+        // =========================================================
+        // Mode 7: Sierra Lite (two-row) error-diffusion dithering
+        // =========================================================
+        // Simplified Sierra: distributes error to only 3 neighbours
+        // (2/4 right, 1/4 below-left, 1/4 below). Faster than FS,
+        // nearly the same quality, less directional bias.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_curr[DISPLAYWIDTH + 2];
+            static int16_t err_next[DISPLAYWIDTH + 2];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_curr, 0, sizeof(err_curr));
+                memset(err_next, 0, sizeof(err_next));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_curr[sx + 1];
+                        int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                        int qe  = val - out;
+
+                        // Sierra Lite: 2/4 right, 1/4 below-left, 1/4 below
+                        err_curr[sx + 2] += (qe * 2) >> 2;
+                        err_next[sx]     += (qe * 1) >> 2;
+                        err_next[sx + 1] += (qe * 1) >> 2;
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memcpy(err_curr, err_next, sizeof(err_curr));
+                    memset(err_next, 0, sizeof(err_next));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BN_FLOYD_STEINBERG
+        // =========================================================
+        // Mode 8: Blue-noise-modulated Floyd-Steinberg
+        // =========================================================
+        // The "best of both worlds" hybrid: Floyd-Steinberg error diffusion
+        // with the threshold perturbed by blue noise. This breaks up the
+        // regular "wormy" patterns of pure FS while keeping its superior
+        // grey level reproduction. JTBD16_BN_MODULATION controls the
+        // perturbation amplitude.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_curr[DISPLAYWIDTH + 2];
+            static int16_t err_next[DISPLAYWIDTH + 2];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_curr, 0, sizeof(err_curr));
+                memset(err_next, 0, sizeof(err_next));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_curr[sx + 1];
+
+                        // Blue noise perturbation: shift threshold by ±BN_MODULATION/2
+                        int bn = blue_noise[sy & 15][sx & 15];
+                        int thr = JTBD16_DITHER_THRESHOLD
+                                  + ((bn * JTBD16_BN_MODULATION) >> 8)
+                                  - (JTBD16_BN_MODULATION >> 1);
+
+                        int out = (val > thr) ? 255 : 0;
+                        int qe  = val - out;
+
+                        err_curr[sx + 2] += (qe * 7) >> 4;
+                        err_next[sx]     += (qe * 3) >> 4;
+                        err_next[sx + 1] += (qe * 5) >> 4;
+                        err_next[sx + 2] += (qe * 1) >> 4;
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memcpy(err_curr, err_next, sizeof(err_curr));
+                    memset(err_next, 0, sizeof(err_next));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BN_ATKINSON
+        // =========================================================
+        // Mode 9: Blue-noise-modulated Atkinson
+        // =========================================================
+        // Atkinson error diffusion with blue noise threshold perturbation.
+        // Keeps Atkinson's clean surfaces and sharp edges while the BN
+        // perturbation breaks up the "swimming" patterns in motion.
+        // Should combine the best qualities of modes 0 and 1.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_buf[3][DISPLAYWIDTH];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_buf, 0, sizeof(err_buf));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+                    int er   = sy % 3;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_buf[er][sx];
+
+                        // Blue noise perturbation: shift threshold by ±BN_MODULATION/2
+                        int bn = blue_noise[sy & 15][sx & 15];
+                        int thr = JTBD16_DITHER_THRESHOLD
+                                  + ((bn * JTBD16_BN_MODULATION) >> 8)
+                                  - (JTBD16_BN_MODULATION >> 1);
+
+                        int out = (val > thr) ? 255 : 0;
+                        int qe  = (val - out) >> 3;  // Atkinson: distribute 6/8
+
+                        if (sx + 1 < DISPLAYWIDTH) err_buf[er][sx + 1] += qe;
+                        if (sx + 2 < DISPLAYWIDTH) err_buf[er][sx + 2] += qe;
+                        if (sy + 1 < DISPLAYHEIGHT) {
+                            int r1 = (sy + 1) % 3;
+                            if (sx > 0)                err_buf[r1][sx - 1] += qe;
+                                                       err_buf[r1][sx]     += qe;
+                            if (sx + 1 < DISPLAYWIDTH) err_buf[r1][sx + 1] += qe;
+                        }
+                        if (sy + 2 < DISPLAYHEIGHT) {
+                            err_buf[(sy + 2) % 3][sx] += qe;
+                        }
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memset(err_buf[er], 0, DISPLAYWIDTH * sizeof(int16_t));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BAYER4X4
+        // =========================================================
+        // Mode 10: Bayer 4×4 ordered dithering
+        // =========================================================
+        // Classic ordered dithering using a 4×4 threshold matrix.
+        // No error propagation — each pixel decided independently.
+        // Very stable in motion (no cascading changes), but the 4×4
+        // repeat pattern can produce a visible crosshatch grid.
+        // Recommended by jborza: preferred over FS for real-time video
+        // because small scene changes don't cascade across the whole frame.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+
+            // Bayer 4×4 threshold matrix, scaled to 0-255
+            // M(i,j) = (M4[i][j] + 0.5) * 256/16
+            static const uint8_t bayer4[4][4] = {
+                {  8, 136,  40, 168},
+                {200,  72, 232, 104},
+                { 56, 184,  24, 152},
+                {248, 120, 216,  88},
+            };
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
+                    for (int x = 0; x < DISPLAYWIDTH; x++) {
+                        uint8_t col = 0;
+                        for (int b = 0; b < 8; b++) {
+                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            uint lum = LUM_AT(fb, y, x);
+                            col >>= 1;
+                            if (lum > bayer4[y & 3][x & 3]) col |= 0x80;
+                        }
+                        frame[p * DISPLAYWIDTH + x] = col;
+                    }
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_BAYER8X8
+        // =========================================================
+        // Mode 11: Bayer 8×8 ordered dithering
+        // =========================================================
+        // Larger matrix produces a finer, less visible dither pattern
+        // than 4×4 while retaining the same motion-stability benefits.
+        // 64 threshold levels vs 16 for 4×4.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+
+            // Bayer 8×8 threshold matrix, scaled to 0-255
+            // M(i,j) = (M8[i][j] + 0.5) * 256/64
+            static const uint8_t bayer8[8][8] = {
+                {  2, 130,  34, 162,  10, 138,  42, 170},
+                {194,  66, 226,  98, 202,  74, 234, 106},
+                { 50, 178,  18, 146,  58, 186,  26, 154},
+                {242, 114, 210,  82, 250, 122, 218,  90},
+                { 14, 142,  46, 174,   6, 134,  38, 166},
+                {206,  78, 238, 110, 198,  70, 230, 102},
+                { 62, 190,  30, 158,  54, 182,  22, 150},
+                {254, 126, 222,  94, 246, 118, 214,  86},
+            };
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
+                    for (int x = 0; x < DISPLAYWIDTH; x++) {
+                        uint8_t col = 0;
+                        for (int b = 0; b < 8; b++) {
+                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            uint lum = LUM_AT(fb, y, x);
+                            col >>= 1;
+                            if (lum > bayer8[y & 7][x & 7]) col |= 0x80;
+                        }
+                        frame[p * DISPLAYWIDTH + x] = col;
+                    }
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_SERPENTINE_FS
+        // =========================================================
+        // Mode 12: Serpentine Floyd-Steinberg
+        // =========================================================
+        // Floyd-Steinberg with alternating left-to-right / right-to-left
+        // scan direction each row. This breaks up the directional "wormy"
+        // patterns that standard FS produces, especially in mid-tone areas.
+        // Key technique from Tanner Helland's research.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_curr[DISPLAYWIDTH + 2];
+            static int16_t err_next[DISPLAYWIDTH + 2];
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_curr, 0, sizeof(err_curr));
+                memset(err_next, 0, sizeof(err_next));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+                    int left_to_right = !(sy & 1);
+
+                    if (left_to_right) {
+                        for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                            int lum = LUM_AT(fb, fb_y, sx);
+                            int val = lum + err_curr[sx + 1];
+                            int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                            int qe  = val - out;
+
+                            err_curr[sx + 2] += (qe * 7) >> 4;
+                            err_next[sx]     += (qe * 3) >> 4;
+                            err_next[sx + 1] += (qe * 5) >> 4;
+                            err_next[sx + 2] += (qe * 1) >> 4;
+
+                            if (out) {
+                                frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                            }
+                        }
+                    } else {
+                        // Right-to-left: mirror the FS kernel
+                        for (int sx = DISPLAYWIDTH - 1; sx >= 0; sx--) {
+                            int lum = LUM_AT(fb, fb_y, sx);
+                            int val = lum + err_curr[sx + 1];
+                            int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                            int qe  = val - out;
+
+                            err_curr[sx]     += (qe * 7) >> 4;  // left (reversed)
+                            err_next[sx + 2] += (qe * 3) >> 4;  // below-right (reversed)
+                            err_next[sx + 1] += (qe * 5) >> 4;  // below
+                            err_next[sx]     += (qe * 1) >> 4;  // below-left (reversed)
+
+                            if (out) {
+                                frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                            }
+                        }
+                    }
+
+                    memcpy(err_curr, err_next, sizeof(err_curr));
+                    memset(err_next, 0, sizeof(err_next));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_JJN
+        // =========================================================
+        // Mode 13: Jarvis-Judice-Ninke error-diffusion dithering
+        // =========================================================
+        // 3-row, 12-coefficient kernel distributing error over a wider
+        // neighbourhood than Floyd-Steinberg. Produces smoother results
+        // with less visible directional patterning. Divides by 48.
+        //
+        //             X   7   5
+        //     3   5   7   5   3
+        //     1   3   5   3   1
+        //
+        // All weights sum to 48; uses >>4 then /3 decomposition for speed.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_buf[3][DISPLAYWIDTH + 4]; // +4 for kernel spread
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_buf, 0, sizeof(err_buf));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+                    int r0   = sy % 3;
+                    int r1   = (sy + 1) % 3;
+                    int r2   = (sy + 2) % 3;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int ex = sx + 2; // offset into err_buf (+2 for left kernel spread)
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_buf[r0][ex];
+                        int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                        int qe  = val - out;
+
+                        // JJN kernel: weights/48
+                        // Row 0 (current):         X  7/48  5/48
+                        err_buf[r0][ex + 1] += (qe * 7) / 48;
+                        err_buf[r0][ex + 2] += (qe * 5) / 48;
+                        // Row 1: 3/48  5/48  7/48  5/48  3/48
+                        err_buf[r1][ex - 2] += (qe * 3) / 48;
+                        err_buf[r1][ex - 1] += (qe * 5) / 48;
+                        err_buf[r1][ex]     += (qe * 7) / 48;
+                        err_buf[r1][ex + 1] += (qe * 5) / 48;
+                        err_buf[r1][ex + 2] += (qe * 3) / 48;
+                        // Row 2: 1/48  3/48  5/48  3/48  1/48
+                        err_buf[r2][ex - 2] += (qe * 1) / 48;
+                        err_buf[r2][ex - 1] += (qe * 3) / 48;
+                        err_buf[r2][ex]     += (qe * 5) / 48;
+                        err_buf[r2][ex + 1] += (qe * 3) / 48;
+                        err_buf[r2][ex + 2] += (qe * 1) / 48;
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memset(err_buf[r0], 0, (DISPLAYWIDTH + 4) * sizeof(int16_t));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
+#elif JTBD16_DITHER_MODE == DITHER_STUCKI
+        // =========================================================
+        // Mode 14: Stucki error-diffusion dithering
+        // =========================================================
+        // Similar to JJN but with different weight distribution (1/42).
+        // Slightly sharper edges than JJN while still smoother than FS.
+        //
+        //             X   8   4
+        //     2   4   8   4   2
+        //     1   2   4   2   1
+        //
+        // All weights sum to 42.
+        {
+            static uint8_t frame[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+            static int16_t err_buf[3][DISPLAYWIDTH + 4]; // +4 for kernel spread
+
+            sem_acquire_blocking(&vsync);
+
+            while (true) {
+                uint8_t last_fi = display_frame_index;
+                uint8_t *fb = frame_buffer[display_frame_index];
+
+                memset(frame, 0, sizeof(frame));
+                memset(err_buf, 0, sizeof(err_buf));
+
+                for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
+                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
+                    int page = sy >> 3;
+                    int bit  = sy & 7;
+                    int r0   = sy % 3;
+                    int r1   = (sy + 1) % 3;
+                    int r2   = (sy + 2) % 3;
+
+                    for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
+                        int ex = sx + 2; // offset into err_buf
+                        int lum = LUM_AT(fb, fb_y, sx);
+                        int val = lum + err_buf[r0][ex];
+                        int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
+                        int qe  = val - out;
+
+                        // Stucki kernel: weights/42
+                        // Row 0 (current):         X  8/42  4/42
+                        err_buf[r0][ex + 1] += (qe * 8) / 42;
+                        err_buf[r0][ex + 2] += (qe * 4) / 42;
+                        // Row 1: 2/42  4/42  8/42  4/42  2/42
+                        err_buf[r1][ex - 2] += (qe * 2) / 42;
+                        err_buf[r1][ex - 1] += (qe * 4) / 42;
+                        err_buf[r1][ex]     += (qe * 8) / 42;
+                        err_buf[r1][ex + 1] += (qe * 4) / 42;
+                        err_buf[r1][ex + 2] += (qe * 2) / 42;
+                        // Row 2: 1/42  2/42  4/42  2/42  1/42
+                        err_buf[r2][ex - 2] += (qe * 1) / 42;
+                        err_buf[r2][ex - 1] += (qe * 2) / 42;
+                        err_buf[r2][ex]     += (qe * 4) / 42;
+                        err_buf[r2][ex + 1] += (qe * 2) / 42;
+                        err_buf[r2][ex + 2] += (qe * 1) / 42;
+
+                        if (out) {
+                            frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
+                        }
+                    }
+
+                    memset(err_buf[r0], 0, (DISPLAYWIDTH + 4) * sizeof(int16_t));
+                }
+
+                sem_release(&vsync);
+
+                do {
+                    gpio_put(J_OLED_CS, 0);
+                    gpio_put(J_OLED_DC, 0);
+                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    gpio_put(J_OLED_DC, 1);
+                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    gpio_put(J_OLED_CS, 1);
+                    __dmb();
+                } while (*(volatile uint8_t *)&display_frame_index == last_fi);
+
+                sem_acquire_blocking(&vsync);
+            }
+        }
+
 #else
-        // ---- Original SSD1306 72×40: 3-pass greyscale with parking ----
+#error "JTBD16_DITHER_MODE must be 0-14"
+#endif /* JTBD16_DITHER_MODE */
+
+        #undef LUM_AT
+
+#else  // !JTBD16 — original SSD1306 72×40: 3-pass greyscale with parking
         gpio_put(J_OLED_CS, 0);
         gpio_put(J_OLED_DC, 0);
         spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));

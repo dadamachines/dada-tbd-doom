@@ -1,6 +1,6 @@
 # Doom on DaDa Machines TBD-16
 
-A port of [rp2040-doom](https://github.com/kilograham/rp2040-doom) to the [DaDa Machines TBD-16](https://dadamachines.com) synthesizer hardware, driving its 2.4" SSD1309 128x64 monochrome OLED with phase-shifted blue noise temporal dithering for smooth greyscale rendering.
+A port of [rp2040-doom](https://github.com/kilograham/rp2040-doom) to the [DaDa Machines TBD-16](https://dadamachines.com) synthesizer hardware, driving its 2.4" SSD1309 128x64 monochrome OLED with configurable dithering (15 algorithms) for 1-bit greyscale rendering.
 
 ## Hardware
 
@@ -20,19 +20,15 @@ The upstream [rp2040-doom](https://github.com/kilograham/rp2040-doom) targets th
 - **SSD1309 128x64** instead of SSD1306 72x40 (4x the pixels, different controller init)
 - **I2C button input** from STM32 UI board instead of direct GPIO
 - **PlatformIO build system** instead of CMake -- see platformio.ini and doom_build.py
-- **4-frame phase-shifted blue noise dithering** instead of the original 3-pass contrast-switching greyscale
+- **15 dithering algorithms** with compile-time switching -- see [DITHERING.md](DITHERING.md)
 
 ### Display Rendering
 
 The original rp2040-doom switches between SSD1306 contrast levels to produce greyscale on a tiny 72x40. The SSD1309 on TBD-16 is a 2.4" panel with large visible pixels and no VSYNC signal -- the original approach caused heavy flickering and visible scanlines.
 
-The current renderer uses **4 temporal frames with spatially-offset blue noise thresholds**, cycled rapidly on core 1:
+The default renderer uses **Atkinson error-diffusion dithering** (mode 0), which produces clean surfaces with sharp edges. 14 other algorithms are available for comparison -- see [DITHERING.md](DITHERING.md) for the full list and build instructions.
 
-1. A **16x16 void-and-cluster blue noise** texture provides natural film-grain dithering (no grid artifacts like Bayer)
-2. Each of the **4 frames samples at a different spatial offset** -- offsets (0,0), (7,3), (3,11), (11,7) are coprime to the 16-pixel tile size, breaking moire patterns against Doom's repeating wall textures
-3. The eye integrates all 4 frames -- **5 effective grey levels** per pixel
-4. All frames have similar average brightness -- **minimal flicker** from the SSD1309's asynchronous scanning
-5. A **shadow-lift LUT** (gamma 0.625) opens up dark corridor areas common in Doom
+A configurable **shadow-lift gamma LUT** opens up dark corridor areas common in Doom.
 
 ### Display Orientation
 
@@ -100,7 +96,10 @@ data/
 
 gen_blue_noise2.py      # Blue noise texture generator (void-and-cluster, pure Python)
 gen_remap_lut.py        # Shadow-lift LUT generator
-button-mapping.md       # Physical button layout and Doom control mapping
+MANUAL.md               # User manual -- controls, gameplay tips
+DITHERING.md            # Dithering algorithm reference and test log
+TECHNICAL.md            # Hardware architecture and engineering notes
+button-mapping.md       # I2C protocol and physical button layout
 pinmap.md               # Full hardware pin map (RP2350, ESP32-P4, STM32)
 ```
 
@@ -119,13 +118,16 @@ pinmap.md               # Full hardware pin map (RP2350, ESP32-P4, STM32)
 |---|---|
 | D-pad Up/Down | Move forward / backward |
 | D-pad Left/Right | Turn left / right |
-| FUNC5 (A) | Fire |
-| FUNC6 (B) | Use / Open doors |
-| MASTER (X) | Run |
-| SOUND (Y) | Strafe |
-| D-pad Down + Y | Switch weapon |
+| A (F5) | Fire |
+| B (F6) | Use / Open doors |
+| X (Master) | Strafe modifier (hold + Left/Right to sidestep) |
+| Y (Sound) | Run modifier (hold + direction to move faster) |
+| PLAY | Pause / Menu |
+| REC | Toggle automap |
+| S1 | Previous weapon |
+| S2 | Next weapon |
 
-See [button-mapping.md](button-mapping.md) for the full physical panel layout.
+See [MANUAL.md](MANUAL.md) for the full user manual and [button-mapping.md](button-mapping.md) for the hardware I2C protocol.
 
 ## Credits
 

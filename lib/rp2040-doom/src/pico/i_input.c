@@ -349,7 +349,7 @@ void buttons_getevent() {
 #define UI_ADDR     0x42
 #define UI_RESET_PIN 40
 
-// Partial struct matching STM32 UI board data — only what we need to reach mcl_btns
+// Full struct matching STM32 UI board data (must match firmware's send size)
 typedef struct __attribute__((packed)) {
     uint16_t pot_adc_values[8];     // 16 bytes
     uint16_t pot_positions[4];      // 8 bytes
@@ -360,7 +360,9 @@ typedef struct __attribute__((packed)) {
     uint8_t  f_btns_long_press;     // 1 byte
     uint16_t mcl_btns;              // 2 bytes — this is what we need
     uint16_t mcl_btns_long_press;   // 2 bytes
-} ui_data_t;
+    int16_t  accelerometer[3];      // 6 bytes
+    uint32_t systicks;              // 4 bytes
+} ui_data_t;  // total: 48 bytes
 
 static ui_data_t ui_data;
 static uint16_t prev_mcl_btns = 0;
@@ -390,7 +392,15 @@ static const key_type_t mcl_doom_keys[MCL_COUNT] = {
 };
 
 static void i2c_ui_init(void) {
-    // Reset STM32 UI board
+    // Init I2C1 FIRST — pull-ups must be active before STM32 comes out
+    // of reset, or its I2C slave sees floating SDA/SCL and may lock up.
+    i2c_init(UI_I2C, 400000);
+    gpio_set_function(UI_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(UI_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(UI_SDA_PIN);
+    gpio_pull_up(UI_SCL_PIN);
+
+    // Now reset STM32 UI board (bus is stable)
     gpio_init(UI_RESET_PIN);
     gpio_set_dir(UI_RESET_PIN, GPIO_OUT);
     gpio_put(UI_RESET_PIN, 0);
@@ -398,19 +408,10 @@ static void i2c_ui_init(void) {
     gpio_put(UI_RESET_PIN, 1);
     sleep_ms(500);
 
-    // Init I2C1
-    i2c_init(UI_I2C, 400000);
-    gpio_set_function(UI_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(UI_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(UI_SDA_PIN);
-    gpio_pull_up(UI_SCL_PIN);
 }
 
 static bool i2c_ui_poll(void) {
-    uint8_t reg = 0;
-    int ret = i2c_write_timeout_us(UI_I2C, UI_ADDR, &reg, 1, true, 5000);
-    if (ret < 0) return false;
-    ret = i2c_read_timeout_us(UI_I2C, UI_ADDR, (uint8_t *)&ui_data, sizeof(ui_data), false, 5000);
+    int ret = i2c_read_timeout_us(UI_I2C, UI_ADDR, (uint8_t *)&ui_data, sizeof(ui_data), false, 10000);
     return (ret == sizeof(ui_data));
 }
 

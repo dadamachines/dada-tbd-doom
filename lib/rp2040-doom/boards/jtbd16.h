@@ -32,17 +32,81 @@
 // Frame period in us (60 Hz = 16667us per game frame)
 #define J_OLED_FRAME_PERIOD 16667
 
-// ======== Display rendering configuration ========
-// SSD1309 128x64 greyscale: 3-pass bit-plane rendering with
-// contrast-weighted sub-frames. ~7 perceived grey levels,
-// same technique as the original rp2040-doom SSD1306 driver.
-// No parking needed — contrast command is 2 bytes (~2µs),
-// much shorter than one COM scan line (~150µs).
+// ======== Dithering Research Framework ========
+// Compile-time switchable dithering modes for 1-bit SSD1309.
+// Change JTBD16_DITHER_MODE to select a method, then rebuild.
 //
-// Shadow-lift LUT: set to 1 to apply a pow(0.625) remap that
-// opens up dark DOOM areas. Set to 0 for raw palette values.
-#ifndef JTBD16_SHADOW_LIFT
-#define JTBD16_SHADOW_LIFT 1
+// Modes:
+//   0 = Atkinson error diffusion       (clean surfaces, sharp edges)
+//   1 = Blue noise ordered (static)    (stable, zero flicker, screen-anchored)
+//   2 = 4-frame temporal blue noise    (5 grey levels, slight shimmer)
+//   3 = 3-pass contrast-weighted       (upstream greyscale, may flicker)
+//   4 = Blue noise + edge boost        (static BN + unsharp mask)
+//   5 = Hybrid Atkinson + HUD          (Atkinson viewport, hard-threshold HUD)
+//   6 = Floyd-Steinberg                (classic full error diffusion)
+//   7 = Sierra Lite                    (fast 2-neighbour error diffusion)
+//   8 = BN-modulated Floyd-Steinberg   (FS + blue noise threshold perturbation)
+//   9 = BN-modulated Atkinson          (Atkinson + blue noise perturbation)
+//  10 = Bayer 4×4 ordered              (stable in motion, visible grid at small size)
+//  11 = Bayer 8×8 ordered              (larger matrix, softer grid pattern)
+//  12 = Serpentine Floyd-Steinberg     (FS with alternating scan to reduce worms)
+//  13 = Jarvis-Judice-Ninke            (3-row 12-coeff, smoothest error diffusion)
+//  14 = Stucki                         (JJN variant, 1/42 normalization)
+
+// Named constants for readability
+#define DITHER_ATKINSON          0
+#define DITHER_BLUENOISE_STATIC  1
+#define DITHER_BLUENOISE_TEMPORAL 2
+#define DITHER_3PASS_CONTRAST    3
+#define DITHER_BLUENOISE_EDGE    4
+#define DITHER_HYBRID_HUD        5
+#define DITHER_FLOYD_STEINBERG   6
+#define DITHER_SIERRA_LITE       7
+#define DITHER_BN_FLOYD_STEINBERG 8
+#define DITHER_BN_ATKINSON       9
+#define DITHER_BAYER4X4         10
+#define DITHER_BAYER8X8         11
+#define DITHER_SERPENTINE_FS    12
+#define DITHER_JJN              13
+#define DITHER_STUCKI           14
+
+#ifndef JTBD16_DITHER_MODE
+#define JTBD16_DITHER_MODE DITHER_ATKINSON
+#endif
+
+// Shadow-lift gamma curve for the remap LUT.
+//   0 = pow(0.50)  — aggressive shadow lift (brightest darks)
+//   1 = pow(0.625) — moderate shadow lift
+//   2 = pow(0.80)  — mild shadow lift
+//   3 = linear     — black/white point only, no gamma
+#ifndef JTBD16_SHADOW_GAMMA
+#define JTBD16_SHADOW_GAMMA 0
+#endif
+
+// Dithering threshold — the black/white decision point (0-255).
+// Lower = brighter overall output.  Affects modes 0, 1, 4, 5.
+#ifndef JTBD16_DITHER_THRESHOLD
+#define JTBD16_DITHER_THRESHOLD 110
+#endif
+
+// Edge boost parameters (mode 4 only)
+#ifndef JTBD16_EDGE_STRENGTH
+#define JTBD16_EDGE_STRENGTH 48   // 0-128, higher = more sharpening
+#endif
+
+// HUD region parameters (mode 5 only)
+#ifndef JTBD16_HUD_Y_START
+#define JTBD16_HUD_Y_START 52     // rows >= this use hard threshold
+#endif
+#ifndef JTBD16_HUD_THRESHOLD
+#define JTBD16_HUD_THRESHOLD 100  // threshold for HUD region
+#endif
+
+// Blue noise modulation strength (modes 8, 9 only)
+// How much the blue noise perturbs the error-diffusion threshold.
+// Higher = more organic texture, lower = closer to pure error diffusion.
+#ifndef JTBD16_BN_MODULATION
+#define JTBD16_BN_MODULATION 48   // 0-128, perturbation amplitude
 #endif
 
 // Display resolution
@@ -91,6 +155,12 @@
 // --- PSRAM ---
 #define J_PSRAM_CS 19
 #define J_PSRAM_SIZE (8 * 1024 * 1024)
+
+// --- Boot Debug Display ---
+// Set to 1 to show boot stage numbers and hex diagnostics on OLED
+#ifndef JTBD16_BOOT_DEBUG
+#define JTBD16_BOOT_DEBUG 0
+#endif
 
 // --- UART (Debug via Pico Debug Probe) ---
 // UART1 TX on GPIO20 is connected to the debug probe
