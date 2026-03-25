@@ -1,0 +1,12 @@
+{
+  "name": "lcdspi",
+  "version": "1.0.0",
+  "description": "SSD1309 OLED display driver (SPI) for TBD-16",
+  "frameworks": "picosdk",
+  "platforms": "raspberrypi",
+  "build": {
+    "srcFilter": ["+<ssd1309.c>"],
+    "includeDir": ".",
+    "flags": ["-Ifonts"]
+  }
+}

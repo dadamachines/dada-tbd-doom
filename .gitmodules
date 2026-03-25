@@ -1,0 +1,4 @@
+[submodule "lib/rp2040-doom"]
+	path = lib/rp2040-doom
+	url = https://github.com/AncientJames/rp2040-doom.git
+	branch = rp2040

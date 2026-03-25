@@ -1,0 +1,97 @@
+dadamachines TBD App Template
+
+The official starting point for building RP2350 apps for the dadamachines
+TBD-16 audio DSP platform.
+
+This repository is maintained by dadamachines and originated from the
+RP2350 firmware template developed by Robert Manzke at the Creative
+Technologies Arbeitsgruppe of Kiel University of Applied Sciences:
+https://www.creative-technologies.de
+
+(c) 2024-2026 Robert Manzke. All rights reserved. (Original RP2350 firmware template and SPI API)
+(c) 2024-2026 Johannes Elias Lohbihler for dadamachines. (App template adaptation, documentation)
+
+
+SOFTWARE LICENSE
+----------------
+
+This repository is licensed under the
+GNU Lesser General Public License (LGPL 3.0)
+https://www.gnu.org/licenses/lgpl-3.0.txt
+
+LGPL 3.0 means:
+- Individual developers can freely use, modify, and contribute to this
+  code without being required to release their own unrelated code.
+- Your app (the code you write that links against these libraries) can
+  be any license you choose, including proprietary.
+- Modifications to the template libraries themselves (SpiAPI, Midi, Ui,
+  etc.) must be shared under the same LGPL 3.0 terms if distributed.
+- Other companies may not use these components commercially without
+  contributing their modifications back as open source.
+- If you need a commercial license that allows proprietary modifications
+  to the libraries, contact dadamachines: https://dadamachines.com/contact/
+
+
+YOUR APP CODE
+-------------
+
+The code you write in your app (e.g. your main.cpp, your custom UI logic,
+your sequencer, your effects controller) is YOUR code under YOUR license.
+
+The LGPL applies only to the template libraries provided in this repository
+(src/SpiAPI, src/Midi, src/MidiParser, src/Ui, and related headers). If you
+modify those libraries and distribute the result, share the modifications
+under LGPL 3.0.
+
+
+THE DADAMACHINES NAME AND BRAND
+-------------------------------
+The dadamachines name, logo, and TBD-16 product name are trademarks of
+dadamachines and are reserved for products produced by or licensed by
+dadamachines.
+
+If you build a product or app using the TBD platform, you may reference it as:
+  - [YourApp] for TBD
+  - [YourApp] (TBD-compatible)
+
+Using "dadamachines [YourApp]" or "TBD-16 [YourApp]" is not permitted
+without prior agreement.
+
+
+COMMERCIAL USE
+--------------
+If you want to build a commercial product around the TBD platform:
+
+  - TBD-Core: Our core DSP board with all audio, MIDI, and USB I/O
+    assembled. Connect your own UI board via the 30-pin FFC connector
+    and design your own enclosure.
+  - Custom Integration: We integrate the ESP32-P4, RP2350, and codec
+    directly onto your PCB for full control over form factor, connectors,
+    and BOM.
+
+See https://dadamachines.com/contact/ for details.
+
+If you modify the template libraries and distribute them, those
+modifications must be released under LGPL 3.0. If you would like to keep
+your modifications proprietary, dadamachines can provide a commercial
+license. Contact us: https://dadamachines.com/contact/
+
+
+HARDWARE DESIGNS
+----------------
+The dadamachines TBD-16 (desktop instrument) and TBD-Core (core DSP board
+for custom products) are commercial products. Their hardware designs are
+proprietary and not released under an open-source license.
+
+An open-hardware core design based on the same ESP32-P4 + RP2350 platform
+is planned for future publication in KiCad as an open-source reference,
+to foster education, prototyping, and instrument design.
+
+
+DISCLAIMER
+----------
+TBD is provided "as is" without any express or implied warranties.
+
+License and copyright details for specific submodules or third-party
+libraries are included in their respective folders / files if different
+from this license.

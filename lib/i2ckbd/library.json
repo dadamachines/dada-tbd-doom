@@ -1,0 +1,11 @@
+{
+  "name": "i2ckbd",
+  "version": "1.0.0",
+  "description": "I2C keyboard/UI board driver for TBD-16 (STM32F0)",
+  "frameworks": "picosdk",
+  "platforms": "raspberrypi",
+  "build": {
+    "srcFilter": ["+<i2ckbd.c>"],
+    "includeDir": "."
+  }
+}

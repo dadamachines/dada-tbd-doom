@@ -1,0 +1,15 @@
+*.bak
+*.old
+*.tmp
+secrets*
+build/
+*.nogit
+~*
+.idea
+.vscode
+.venv
+.esphome
+secrets.*
+.pioenvs
+.pio
+.env
