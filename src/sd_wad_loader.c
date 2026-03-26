@@ -96,6 +96,15 @@ int sd_wad_load(void) {
     disk_deinitialize();
     printf("[SD-WAD] SPI0 deinitialized — pins free for P4 state-api link\n");
 
+    /* Initialize P4 control link (using int to avoid stdbool.h issues) */
+    extern void p4_control_link_init(void);
+    extern int p4_control_link_wait_alive(unsigned min_pulses, unsigned timeout_ms);
+    extern int p4_control_link_set_active_plugin(unsigned char channel, const char *plugin_name);
+    p4_control_link_init();
+    if (p4_control_link_wait_alive(100, 5000)) {
+        p4_control_link_set_active_plugin(0, "PicoAudioBridge");
+    }
+
     /* Validate WAD magic */
     if (total_read < 4 ||
         psram[0] != 'I' || psram[1] != 'W' || psram[2] != 'H' || psram[3] != 'X') {

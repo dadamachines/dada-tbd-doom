@@ -15,6 +15,7 @@
 #include "w_wad.h"
 #include "doomtype.h"
 #include "pico_audio_bridge.h"
+#include "p4_control_link.h"
 #include "p4_spi_transport.h"
 #include "picoflash.h"
 
@@ -320,6 +321,9 @@ static void I_Pico_ShutdownSound(void) {
 static boolean I_Pico_InitSound(boolean _use_sfx_prefix) {
     use_sfx_prefix = _use_sfx_prefix;
     pab_init();
+
+    // P4 control link is initialized in sd_wad_loader.c after SD card release
+
     p4_spi_transport_init();
     sound_initialized = true;
     printf("[DOOM] Sound initialized (SPI bridge, %d Hz)\n", PICO_SOUND_SAMPLE_FREQ);

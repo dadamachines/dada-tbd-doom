@@ -66,7 +66,7 @@ static void ws_isr_callback(uint gpio, uint32_t events) {
 void p4_spi_transport_init(void) {
     // ── SPI1 peripheral ────────────────────────────────────────────────
     spi_init(P4_SPI, P4_SPI_FREQ);
-    spi_set_format(P4_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    spi_set_format(P4_SPI, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
 
     gpio_set_function(P4_CLK_PIN,  GPIO_FUNC_SPI);
     gpio_set_function(P4_MOSI_PIN, GPIO_FUNC_SPI);
