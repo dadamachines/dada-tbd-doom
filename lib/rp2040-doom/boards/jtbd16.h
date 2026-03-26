@@ -151,6 +151,7 @@
 #define J_SD_DAT2 6
 #define J_SD_DAT3 7
 #define J_SD_DETECT 8
+#define J_SD_POWER_EN 17
 
 // --- PSRAM ---
 #define J_PSRAM_CS 19

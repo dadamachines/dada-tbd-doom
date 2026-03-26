@@ -39,6 +39,9 @@
 #include "doomtype.h"
 #include "i_system.h"
 #include "m_argv.h"
+#if USE_SD_WAD
+extern int sd_wad_load(void);
+#endif
 
 //
 // D_DoomMain()
@@ -91,6 +94,14 @@ int main(int argc, char **argv)
     debug_show_stage(2); // Stage 2: before stdio_init_all
     stdio_init_all();
     printf("[DOOM] stdio OK\n");
+#endif
+#if USE_SD_WAD
+    debug_show_stage(5); // Stage 5: loading WAD from SD card
+    printf("[DOOM] Loading WAD from SD card...\n");
+    if (sd_wad_load() != 0) {
+        panic("[DOOM] Failed to load WAD from SD card!");
+    }
+    printf("[DOOM] SD WAD load complete\n");
 #endif
 #if PICO_BUILD
     debug_show_stage(3); // Stage 3: before I_Init

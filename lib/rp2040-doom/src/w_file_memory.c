@@ -34,15 +34,24 @@
 #endif
 
 #if PICO_ON_DEVICE
+#if USE_SD_WAD
+/* SD WAD: base address set at runtime by sd_wad_loader before D_DoomMain */
+#define wad_map_base ((const uint8_t *)0)  /* placeholder for bi_decl only */
+#if WHD_SUPER_TINY
+#define ADDR_FNAME "WHX from SD card (PSRAM)"
+#else
+#define ADDR_FNAME "WHD from SD card (PSRAM)"
+#endif
+#else
 #ifndef TINY_WAD_ADDR
 #error TINY_WAD_ADDR must be specified
 #endif
 #define wad_map_base ((const uint8_t *)TINY_WAD_ADDR)
-// simplest thing here is to use a feature, rather than a separate feature group
 #if WHD_SUPER_TINY
 #define ADDR_FNAME "WHX at " __XSTRING(TINY_WAD_ADDR)
 #else
 #define ADDR_FNAME "WHD at " __XSTRING(TINY_WAD_ADDR)
+#endif
 #endif
 bi_decl(bi_program_feature(ADDR_FNAME));
 #endif
@@ -54,17 +63,37 @@ bi_decl(bi_program_feature(ADDR_FNAME));
 #include "tiny.whd.h"
 #define wad_map_base tiny_whd
 #endif
+#if USE_SD_WAD
+/* Runtime-settable: sd_wad_loader sets this before D_DoomMain */
+const uint8_t *whd_map_base = 0;
+#else
 const uint8_t *whd_map_base = wad_map_base;
+#endif
 #endif
 
 extern const wad_file_class_t memory_wad_file;
 
+#if USE_SD_WAD
+/* Non-const so sd_wad_set_base() can update .mapped at runtime */
+static wad_file_t fileo = {
+        .file_class = &memory_wad_file,
+        .length = 0,
+        .mapped = 0,
+        .path = "<sdcard>",
+};
+
+void sd_wad_set_base(const uint8_t *base) {
+    whd_map_base = base;
+    fileo.mapped = base;
+}
+#else
 static const wad_file_t fileo = {
         .file_class = &memory_wad_file,
         .length = 0, // seemingly unused
         .mapped = wad_map_base,
         .path = "<here>",
 };
+#endif
 
 static wad_file_t *W_Memory_OpenFile(const char *path)
 {
@@ -75,7 +104,11 @@ static wad_file_t *W_Memory_OpenFile(const char *path)
 #if WHD_SUPER_TINY
     if (fileo.mapped[0] != 'I' || fileo.mapped[1] != 'W' || fileo.mapped[2] != 'H' || fileo.mapped[3] != 'X') {
 #if PICO_ON_DEVICE
+#if USE_SD_WAD
+        panic("No WHX in PSRAM (SD WAD load failed?)");
+#else
         panic("No WXD at %p\n", TINY_WAD_ADDR);
+#endif
 #else
         panic("Expected WXD format");
 #endif
@@ -83,7 +116,11 @@ static wad_file_t *W_Memory_OpenFile(const char *path)
 #else
     if (fileo.mapped[0] != 'I' || fileo.mapped[1] != 'W' || fileo.mapped[2] != 'H' || fileo.mapped[3] != 'D') {
 #if PICO_ON_DEVICE
+#if USE_SD_WAD
+        panic("No WHD in PSRAM (SD WAD load failed?)");
+#else
         panic("No WHD at %p\n", TINY_WAD_ADDR);
+#endif
 #else
         panic("Expected WHD format");
 #endif

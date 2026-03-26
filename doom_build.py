@@ -35,6 +35,7 @@ env.Append(CPPPATH=[
     os.path.join(doom_src, "adpcm-xq"),         # ADPCM headers
     os.path.join(doom_base, "textscreen"),       # textscreen headers (for types)
     os.path.join(doom_base, "boards"),           # board headers (jtbd16.h)
+    os.path.join(project_dir, "lib", "petit_fatfs"),  # Petit FatFS (for SD WAD)
 ])
 
 # Doom game engine sources (src/doom/)
@@ -113,6 +114,18 @@ if opl_existing:
         os.path.join("$BUILD_DIR", "doom_opl"),
         doom_opl,
         src_filter=" ".join(opl_filter)
+    )
+
+# Petit FatFS (for SD card WAD loading)
+petit_fatfs_dir = os.path.join(project_dir, "lib", "petit_fatfs")
+petit_fatfs_files = ["pff.c", "diskio.c"]
+pf_existing = [f for f in petit_fatfs_files if os.path.exists(os.path.join(petit_fatfs_dir, f))]
+if pf_existing:
+    pf_filter = ["-<*>"] + ["+<%s>" % f for f in petit_fatfs_files]
+    env.BuildSources(
+        os.path.join("$BUILD_DIR", "petit_fatfs"),
+        petit_fatfs_dir,
+        src_filter=" ".join(pf_filter)
     )
 
 # Pre-link: weaken SDK's __wrap_printf etc. so our no-ops in doom_stub.c win.

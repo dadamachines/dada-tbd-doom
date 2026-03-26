@@ -10,7 +10,34 @@ A port of [rp2040-doom](https://github.com/kilograham/rp2040-doom) to the [DaDa 
 | **Display** | SSD1309 128x64 OLED, 2.4", monochrome, SPI1 at 8 MHz |
 | **Input** | STM32 UI board via I2C1 (D-pad, buttons, encoders) |
 | **Audio** | Not yet implemented (stubs present) |
-| **Storage** | Doom WAD embedded in flash (doom1.whx) |
+| **PSRAM** | 8 MB APS6404 on QMI CS1 (GPIO19) |
+| **Storage** | Doom WAD loaded from SD card into PSRAM at boot |
+
+## Installation (End Users)
+
+You need two things: the firmware UF2 and the Doom WAD file on your SD card.
+
+### 1. Prepare the SD Card
+
+1. Insert the TBD-16 SD card into your computer
+2. Create a folder called `data` in the root of the SD card
+3. Copy `doom1.whx` into that folder
+4. Eject the SD card and insert it back into the TBD-16
+
+The file should be at: `SD:/data/doom1.whx`
+
+### 2. Flash the Firmware
+
+1. Put the TBD-16 into BOOTSEL mode (hold BOOTSEL while connecting USB)
+2. A USB drive called **RPI-RP2** will appear on your computer
+3. Drag and drop `firmware.uf2` onto the **RPI-RP2** drive
+4. The device will reboot and Doom will start automatically
+
+The firmware is only ~500 KB. At boot it loads the WAD from the SD card into the 8 MB PSRAM, which takes about 2 seconds.
+
+> **Note:** The WAD file is not included in this repository. You need a copy of the Doom 1 shareware WAD converted to WHX format.
+
+---
 
 ## What's Different from Upstream rp2040-doom
 
@@ -46,14 +73,19 @@ The SSD1309 on TBD-16 is physically mounted 180 degrees rotated. The driver uses
 ### Build & Flash
 
 ```bash
-# Build and upload via debug probe (recommended)
+# Build only (output: .pio/build/doom-tbd16/firmware.uf2)
+pio run
+
+# Build and upload via debug probe
 pio run -t upload
 
-# Build only (output in .pio/build/doom-tbd16/)
-pio run
+# Flash via debug probe (without rebuilding)
+./flash.sh firmware
 ```
 
-> **Important:** Always flash via the CMSIS-DAP debug probe (pio run -t upload). The WAD data handling and flash layout require the debug probe workflow. Do not use UF2 drag-and-drop.
+The firmware UF2 (~500 KB) can also be flashed via BOOTSEL drag-and-drop — see **Installation** above.
+
+The Doom WAD (`doom1.whx`) must be placed on the SD card at `/data/doom1.whx`. It is loaded into PSRAM at boot.
 
 ### How the Build Works
 

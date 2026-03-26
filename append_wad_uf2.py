@@ -129,6 +129,30 @@ try:
             print("  [WAD] firmware.uf2 not found, skipping")
             return
 
+        # When USE_SD_WAD is enabled, the WAD is loaded from SD card at
+        # runtime — don't embed it in the UF2 (firmware-only ~250KB).
+        build_flags = env.get("BUILD_FLAGS", [])
+        cppdefines = env.get("CPPDEFINES", [])
+        sd_wad = False
+        for item in cppdefines:
+            if isinstance(item, tuple):
+                if item[0] == "USE_SD_WAD":
+                    sd_wad = True
+                    break
+            elif item == "USE_SD_WAD":
+                sd_wad = True
+                break
+        if not sd_wad:
+            # Also check raw build flags string
+            flags_str = " ".join(str(f) for f in build_flags)
+            sd_wad = "-DUSE_SD_WAD=1" in flags_str or "-DUSE_SD_WAD " in flags_str
+
+        if sd_wad:
+            print("  [WAD] USE_SD_WAD=1 — WAD loaded from SD card at runtime, skipping UF2 embed")
+            uf2_size = os.path.getsize(uf2_path)
+            print(f"  [WAD] Firmware-only UF2: {uf2_size} bytes ({uf2_size // 1024} KB)")
+            return
+
         wad_path = find_wad_file(project_dir)
         if not wad_path:
             print(

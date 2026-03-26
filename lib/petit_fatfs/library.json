@@ -1,0 +1,13 @@
+{
+    "name": "petit_fatfs",
+    "version": "0.03a",
+    "description": "Petit FatFS - minimal FAT filesystem for SD card WAD loading (from uf2loader)",
+    "frameworks": "picosdk",
+    "platforms": "raspberrypi",
+    "build": {
+        "flags": [
+            "-Wno-unused-variable",
+            "-Wno-unused-but-set-variable"
+        ]
+    }
+}
