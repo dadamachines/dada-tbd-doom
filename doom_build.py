@@ -35,7 +35,9 @@ env.Append(CPPPATH=[
     os.path.join(doom_src, "adpcm-xq"),         # ADPCM headers
     os.path.join(doom_base, "textscreen"),       # textscreen headers (for types)
     os.path.join(doom_base, "boards"),           # board headers (jtbd16.h)
-    os.path.join(project_dir, "lib", "petit_fatfs"),  # Petit FatFS (for SD WAD)
+    os.path.join(project_dir, "lib", "no-OS-FatFS-SD-SDIO-SPI-RPi-Pico", "src", "include"),  # FatFs library headers
+    os.path.join(project_dir, "lib", "no-OS-FatFS-SD-SDIO-SPI-RPi-Pico", "src", "sd_driver"),  # sd_card.h
+    os.path.join(project_dir, "lib", "no-OS-FatFS-SD-SDIO-SPI-RPi-Pico", "src", "ff15", "source"),  # ff.h
 ])
 
 # Doom game engine sources (src/doom/)

@@ -1,5 +1,6 @@
 #pragma once
 #include "DaDa_SPI.h"
+#include "SpiProtocol.h"
 // Sec. 4.2.10.4. mutex, pg. 383 pi-pico reference https://datasheets.raspberrypi.com/pico/raspberry-pi-pico-c-sdk.pdf
 #include "pico/mutex.h"
 #include <atomic>
@@ -27,6 +28,8 @@ class Midi final{
     std::atomic<uint32_t> p4Alive {0}; // P4 ready status
     DaDa_SPI real_time_spi {spi1, 29, 31, 28, 30, 22, 30000000};
     bool bypassLegacyMidiParser {false}; // bypass legacy MIDI parser, use only USB MIDI parser
+    bool doomAudioMode {false}; // doom audio: pack p4_spi_request with PCM
+    uint8_t spi_sequence_counter {100}; // p4 protocol sequence counter (100-199)
     mutex_t real_time_mutex; // mutex for real-time state buffer
     mutex_t ableton_link_data_mutex; // mutex for ableton link state data
     std::atomic<uint32_t> real_time_state_buffer_consumed {0};
@@ -36,6 +39,7 @@ public:
     void Init();
     void Update();
     void SetBypassLegacyMidiParser(bool bypass);
+    void SetDoomAudioMode(bool enable) { doomAudioMode = enable; }
     uint32_t GetLedStatus() const {
         return ledStatus.load();
     }

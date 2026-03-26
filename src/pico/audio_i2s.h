@@ -6,6 +6,7 @@
 
 typedef struct audio_buffer_mem {
     uint8_t *bytes;
+    uint32_t size;
 } audio_buffer_mem_t;
 
 typedef struct audio_buffer {

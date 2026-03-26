@@ -149,8 +149,16 @@ void Ui::Update(){
     // de-assert stm reset
     if (resetRequested){
         resetRequested = false;
+        doomAudioInitialized = false; // re-init after P4 reboot
         digitalWrite(STM32RESET_PIN, true);
         delay(1000);
+    }
+
+    // One-shot: activate PicoAudioBridge plugin on P4
+    if (!doomAudioInitialized) {
+        doomAudioInitialized = true;
+        spi_api.SetActivePlugin(0, "PicoAudioBridge");
+        midi.SetDoomAudioMode(true);
     }
 
     RunUITests();

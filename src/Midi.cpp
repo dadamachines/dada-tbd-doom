@@ -1,7 +1,9 @@
 #include "Midi.h"
 #include "MidiParser.h"
 #include "MidiRunningStatusExpander.h"
+#include "pico_audio_bridge.h"
 #include <SerialPIO.h>
+#include <string.h>
 
 static MidiParser midiparser; // MIDI handling
 static MidiRunningStatusExpander midi_exp_uart0; // MIDI running status expander
@@ -230,7 +232,7 @@ void Midi::Update(){
         current_trans ^= 0x1;
 
         // get forwarded data from p4 usb device in, send through regular spi transaction
-        if (spi_trans[current_trans].in_buf[0] == 0xCA && spi_trans[current_trans].in_buf[1] == 0xFE){
+        if (!doomAudioMode && spi_trans[current_trans].in_buf[0] == 0xCA && spi_trans[current_trans].in_buf[1] == 0xFE){
             // fingerprint matches, we have a valid transfer
             // update the LED status from the SPI transfer
             uint32_t *led = (uint32_t *) &spi_trans[current_trans].in_buf[BUF_OFFSET_LED];
@@ -251,7 +253,34 @@ void Midi::Update(){
             }
         }
         // check if we should use legacy midi parser
-        if (!bypassLegacyMidiParser){
+        if (doomAudioMode) {
+            // Pack p4_spi_request_header + p4_spi_request2 for PicoAudioBridge
+            uint8_t *base = spi_trans[current_trans].out_buf + 2; // after 0xCAFE
+            auto *hdr = reinterpret_cast<p4_spi_request_header*>(base);
+            auto *req = reinterpret_cast<p4_spi_request2*>(base + sizeof(p4_spi_request_header));
+
+            memset(hdr, 0, sizeof(*hdr));
+            memset(req, 0, sizeof(*req));
+
+            // Fill payload
+            req->magic = 0xFEEDC0DE;
+            req->magic2 = 0xFEEDC0DE;
+            req->synth_midi_length = pab_pack_spi(req->synth_midi, sizeof(req->synth_midi));
+
+            // Fill header
+            hdr->magic = 0xCAFE;
+            hdr->request_sequence_counter = spi_sequence_counter;
+            spi_sequence_counter = 100 + ((spi_sequence_counter - 100 + 1) % 100);
+            hdr->payload_length = sizeof(p4_spi_request2);
+
+            // CRC: sum = 42, add each payload byte
+            const uint8_t *payload = reinterpret_cast<const uint8_t*>(req);
+            uint16_t crc = 42;
+            for (uint16_t i = 0; i < sizeof(p4_spi_request2); i++) {
+                crc += payload[i];
+            }
+            hdr->payload_crc = crc;
+        } else if (!bypassLegacyMidiParser){
             // if we have a word clock sync /32 = one block size, then we can update the MIDI parser
             // replace the midi parser for your own implementation if you want to use a different MIDI parser or none at all!
             midiparser.Update(spi_trans[current_trans].out_buf + 2); // skip fingerprint bytes

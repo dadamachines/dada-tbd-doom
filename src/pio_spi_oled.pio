@@ -1,0 +1,26 @@
+/*
+ * PIO SPI TX-only program for OLED display (SPI Mode 0).
+ *
+ * Protocol: CPOL=0, CPHA=0 (data sampled on rising edge, shifted on falling).
+ * Autopull 8 bits, MSB first, TX only (no MISO).
+ *
+ * Side-set pin: SCK (1 pin)
+ * OUT pin: MOSI (1 pin)
+ *
+ * At 150 MHz system clock:
+ *   clkdiv=2.0 → 37.5 MHz SPI clock (each bit = 2 PIO cycles × 2 sys clocks)
+ *   clkdiv=8.0 → ~9.4 MHz SPI clock
+ *   clkdiv=10.0 → 7.5 MHz SPI clock
+ *
+ * We use 2 PIO instructions per bit:
+ *   Instruction 1: side 0 - shift out data bit on MOSI (falling edge)
+ *   Instruction 2: side 1 - clock rises (slave samples)
+ */
+
+.program pio_spi_oled
+.side_set 1
+
+.wrap_target
+    out pins, 1   side 0  ; Set MOSI, SCK low (data setup)
+    nop           side 1  ; SCK high (slave samples on rising edge)
+.wrap

@@ -10,6 +10,7 @@
 #include "hardware/timer.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pio_spi_oled.h"
 
 #include "ssd1309.h"
 #include "i2ckbd.h"
@@ -68,9 +69,7 @@ void ssd1309_spi_init(void) {
     gpio_set_dir(OLED_DC, GPIO_OUT);
     gpio_set_dir(OLED_RST, GPIO_OUT);
 
-    spi_init(SSD1309_SPI_INST, SSD1309_SPI_SPEED);
-    gpio_set_function(OLED_SCLK, GPIO_FUNC_SPI);
-    gpio_set_function(OLED_MOSI, GPIO_FUNC_SPI);
+    oled_spi_init();
 
     gpio_put(OLED_CS, 1);
     gpio_put(OLED_RST, 1);
@@ -79,7 +78,7 @@ void ssd1309_spi_init(void) {
 void ssd1309_command(uint8_t cmd) {
     gpio_put(OLED_DC, 0);
     gpio_put(OLED_CS, 0);
-    spi_write_blocking(SSD1309_SPI_INST, &cmd, 1);
+    oled_spi_write_blocking(&cmd, 1);
     gpio_put(OLED_CS, 1);
 }
 
@@ -88,7 +87,7 @@ bool ssd1309_command_list(const uint8_t *commands, size_t count) {
     gpio_put(OLED_CS, 0);
 
     for (size_t i = 0; i < count; i++) {
-        spi_write_blocking(SSD1309_SPI_INST, &commands[i], 1);
+        oled_spi_write_blocking(&commands[i], 1);
     }
 
     gpio_put(OLED_CS, 1);
@@ -98,7 +97,7 @@ bool ssd1309_command_list(const uint8_t *commands, size_t count) {
 void ssd1309_data(uint8_t data) {
     gpio_put(OLED_DC, 1);
     gpio_put(OLED_CS, 0);
-    spi_write_blocking(SSD1309_SPI_INST, &data, 1);
+    oled_spi_write_blocking(&data, 1);
     gpio_put(OLED_CS, 1);
 }
 
@@ -177,7 +176,7 @@ void ssd1309_display(void) {
 
         gpio_put(OLED_DC, 1);
         gpio_put(OLED_CS, 0);
-        spi_write_blocking(SSD1309_SPI_INST, &display_buffer[page * SSD1309_WIDTH], SSD1309_WIDTH);
+        oled_spi_write_blocking(&display_buffer[page * SSD1309_WIDTH], SSD1309_WIDTH);
         gpio_put(OLED_CS, 1);
     }
 }
@@ -547,7 +546,7 @@ void hw_read_spi(unsigned char *buff, int cnt) {
 }
 
 void hw_send_spi(const unsigned char *buff, int cnt) {
-    spi_write_blocking(SSD1309_SPI_INST, buff, cnt);
+    oled_spi_write_blocking(buff, cnt);
 }
 
 void pin_set_bit(int pin, unsigned int offset) {

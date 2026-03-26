@@ -60,6 +60,7 @@ class Ui{
     bool p4Ready{false}; // P4 ready indicator
     bool resetRequested{false}; // reset request indicator
     bool sdInitialized{false}; // SD card initialized indicator
+    bool doomAudioInitialized{false}; // one-shot init for doom audio plugin
 
     void displayString(const std::string& s);
     void displayStringWait1s(const std::string& s);

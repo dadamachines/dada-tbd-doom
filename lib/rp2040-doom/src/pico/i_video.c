@@ -65,6 +65,7 @@
 #include "hardware/dma.h"
 #include "hardware/structs/xip_ctrl.h"
 #include "hardware/spi.h"
+#include "pio_spi_oled.h"
 #else
 #include "SDL_image.h"
 #include "SDL_mutex.h"
@@ -455,7 +456,7 @@ static const uint8_t contrast[3] = {
     0xDF, 0x5F, 0x17  // SSD1309 greyscale levels (tuned for TBD-16)
 };
 
-#define TBD_SPI spi1
+// SPI for OLED now uses PIO — see pio_spi_oled.c
 
 #else  // !JTBD16 — original SSD1306 72×40
     0xAE,           //display off
@@ -527,7 +528,7 @@ void debug_show_stage(int stage) {
     gpio_put(J_OLED_DC, 0);
     gpio_put(J_OLED_CS, 0);
     uint8_t pos_cmd[] = {0x21, 0x00, 0x7F, 0x22, 0x00, 0x00}; // col 0-127, page 0 only
-    spi_write_blocking(TBD_SPI, pos_cmd, sizeof(pos_cmd));
+    oled_spi_write_blocking(pos_cmd, sizeof(pos_cmd));
 
     // Write digit bitmap (data mode)
     gpio_put(J_OLED_CS, 1);
@@ -555,7 +556,7 @@ void debug_show_stage(int stage) {
         col_data[col*4+2] = scaled;
         col_data[col*4+3] = scaled;
     }
-    spi_write_blocking(TBD_SPI, col_data, 128);
+    oled_spi_write_blocking(col_data, 128);
 #endif
 }
 
@@ -574,7 +575,7 @@ void debug_show_hex(uint32_t val) {
     gpio_put(J_OLED_DC, 0);
     gpio_put(J_OLED_CS, 0);
     uint8_t pos_cmd[] = {0x21, 0x00, 0x7F, 0x22, 0x01, 0x01}; // page 1
-    spi_write_blocking(TBD_SPI, pos_cmd, sizeof(pos_cmd));
+    oled_spi_write_blocking(pos_cmd, sizeof(pos_cmd));
     gpio_put(J_OLED_CS, 1);
     gpio_put(J_OLED_DC, 1);
     gpio_put(J_OLED_CS, 0);
@@ -589,7 +590,7 @@ void debug_show_hex(uint32_t val) {
             col_data[x + col*4 + 3] = hex_font[nibble][col];
         }
     }
-    spi_write_blocking(TBD_SPI, col_data, 128);
+    oled_spi_write_blocking(col_data, 128);
 #endif
 }
 
@@ -608,7 +609,7 @@ void debug_show_hex2(uint32_t val) {
     gpio_put(J_OLED_DC, 0);
     gpio_put(J_OLED_CS, 0);
     uint8_t pos_cmd[] = {0x21, 0x00, 0x7F, 0x22, 0x02, 0x02}; // page 2
-    spi_write_blocking(TBD_SPI, pos_cmd, sizeof(pos_cmd));
+    oled_spi_write_blocking(pos_cmd, sizeof(pos_cmd));
     gpio_put(J_OLED_CS, 1);
     gpio_put(J_OLED_DC, 1);
     gpio_put(J_OLED_CS, 0);
@@ -623,7 +624,7 @@ void debug_show_hex2(uint32_t val) {
             col_data[x + col*4 + 3] = hex_font[nibble][col];
         }
     }
-    spi_write_blocking(TBD_SPI, col_data, 128);
+    oled_spi_write_blocking(col_data, 128);
 #endif
 }
 
@@ -655,10 +656,7 @@ void power_on_logo(void) {
     sleep_ms(10);
     gpio_put(J_OLED_RESET, 1);
 
-    gpio_set_function(PICO_DEFAULT_SPI_SCK_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(PICO_DEFAULT_SPI_TX_PIN, GPIO_FUNC_SPI);
-    spi_init(TBD_SPI, 8000000);
-    spi_set_format(TBD_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    oled_spi_init();
 
     gpio_put(J_OLED_CS, 1);
     gpio_put(J_OLED_DC, 0);
@@ -671,7 +669,7 @@ void power_on_logo(void) {
         0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xDF, 0xD9, 0x82,
         0xDB, 0x34, 0xA4, 0xA6, 0x21, 0x00, 0x7F, 0x22, 0x00, 0x07, 0xAF
     };
-    spi_write_blocking(TBD_SPI, cmd_init, sizeof(cmd_init));
+    oled_spi_write_blocking(cmd_init, sizeof(cmd_init));
 
     // Clear screen (1024 bytes = 128x64/8)
     gpio_put(J_OLED_CS, 1);
@@ -680,14 +678,14 @@ void power_on_logo(void) {
 
     uint8_t zeros[128] = {0};
     for (int p = 0; p < 8; p++) {
-        spi_write_blocking(TBD_SPI, zeros, 128);
+        oled_spi_write_blocking(zeros, 128);
     }
 #else
     const uint8_t cmd_init[] = {
         0xAE, 0x20, 0x00, 0x40, 0xA1, 0xA8, 0x27, 0xC8, 0xD3, 0x00, 0xDA, 0x12, 0xD5, 0xF0, 0xD9, 0x11, 0xDB, 0x20, 0x81, 0x7F,
         0xA4, 0xA6, 0x8D, 0x14, 0xAD, 0x30, 0x21, 0x1C, 0x63, 0x22, 0x00, 0x04, 0xAF
     };
-    spi_write_blocking(TBD_SPI, cmd_init, sizeof(cmd_init));
+    oled_spi_write_blocking(cmd_init, sizeof(cmd_init));
 
     gpio_put(J_OLED_CS, 1);
     gpio_put(J_OLED_DC, 1);
@@ -714,7 +712,7 @@ void power_on_logo(void) {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x06, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
         
-    spi_write_blocking(TBD_SPI, dat_logo, sizeof(dat_logo));
+    oled_spi_write_blocking(dat_logo, sizeof(dat_logo));
 #endif // JTBD16
 
     gpio_put(J_OLED_CS, 1);
@@ -741,16 +739,13 @@ static void display_driver_init() {
     gpio_put(J_OLED_RESET, 1);
     sleep_ms(10);
 
-    gpio_set_function(PICO_DEFAULT_SPI_SCK_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(PICO_DEFAULT_SPI_TX_PIN, GPIO_FUNC_SPI);
-    spi_init(TBD_SPI, 8000000);
-    spi_set_format(TBD_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    oled_spi_init();
 
     gpio_put(J_OLED_CS, 1);
     gpio_put(J_OLED_DC, 0);
     gpio_put(J_OLED_CS, 0);
 
-    spi_write_blocking(TBD_SPI, command_initialise, sizeof(command_initialise));
+    oled_spi_write_blocking(command_initialise, sizeof(command_initialise));
 
     gpio_put(J_OLED_CS, 1);
 }
@@ -1214,9 +1209,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1256,9 +1251,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1309,9 +1304,9 @@ static void core1() {
                     for (int f = 0; f < 4; f++) {
                         gpio_put(J_OLED_CS, 0);
                         gpio_put(J_OLED_DC, 0);
-                        spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                        oled_spi_write_blocking(command_park, sizeof(command_park));
                         gpio_put(J_OLED_DC, 1);
-                        spi_write_blocking(TBD_SPI, frames[f], sizeof(frames[0]));
+                        oled_spi_write_blocking(frames[f], sizeof(frames[0]));
                         gpio_put(J_OLED_CS, 1);
                     }
                     __dmb();
@@ -1360,11 +1355,11 @@ static void core1() {
 
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, field_buffer, sizeof(field_buffer));
+                    oled_spi_write_blocking(field_buffer, sizeof(field_buffer));
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_run, sizeof(command_run));
+                    oled_spi_write_blocking(command_run, sizeof(command_run));
                     gpio_put(J_OLED_CS, 1);
                 }
 
@@ -1442,9 +1437,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1517,9 +1512,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1581,9 +1576,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1644,9 +1639,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1716,9 +1711,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1792,9 +1787,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1849,9 +1844,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1907,9 +1902,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1991,9 +1986,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -2073,9 +2068,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -2154,9 +2149,9 @@ static void core1() {
                 do {
                     gpio_put(J_OLED_CS, 0);
                     gpio_put(J_OLED_DC, 0);
-                    spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+                    oled_spi_write_blocking(command_park, sizeof(command_park));
                     gpio_put(J_OLED_DC, 1);
-                    spi_write_blocking(TBD_SPI, frame, sizeof(frame));
+                    oled_spi_write_blocking(frame, sizeof(frame));
                     gpio_put(J_OLED_CS, 1);
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -2174,7 +2169,7 @@ static void core1() {
 #else  // !JTBD16 — original SSD1306 72×40: 3-pass greyscale with parking
         gpio_put(J_OLED_CS, 0);
         gpio_put(J_OLED_DC, 0);
-        spi_write_blocking(TBD_SPI, command_park, sizeof(command_park));
+        oled_spi_write_blocking(command_park, sizeof(command_park));
 
         if (l == 0) {
             sem_acquire_blocking(&vsync);
@@ -2216,9 +2211,9 @@ static void core1() {
         }
 
         gpio_put(J_OLED_DC, 1);
-        spi_write_blocking(TBD_SPI, field_buffer, sizeof(field_buffer));
+        oled_spi_write_blocking(field_buffer, sizeof(field_buffer));
         gpio_put(J_OLED_DC, 0);
-        spi_write_blocking(TBD_SPI, command_run, sizeof(command_run));
+        oled_spi_write_blocking(command_run, sizeof(command_run));
         gpio_put(J_OLED_CS, 1);
 
         frame_time = delayed_by_us(frame_time, FRAME_PERIOD);

@@ -91,8 +91,10 @@ int sd_wad_load(void) {
     printf("[SD-WAD] Loaded %lu bytes (%lu KB)\n",
            (unsigned long)total_read, (unsigned long)(total_read / 1024));
 
-    /* Deinit SD card SPI — free pins for potential SDIO use later */
+    /* Deinit SD card SPI — free spi0 + GPIOs 2,3,4,7 for P4 link reuse */
+    printf("[SD-WAD] Releasing SPI0 (GPIOs 2,3,4,7) for P4 link...\n");
     disk_deinitialize();
+    printf("[SD-WAD] SPI0 deinitialized — pins free for P4 state-api link\n");
 
     /* Validate WAD magic */
     if (total_read < 4 ||
