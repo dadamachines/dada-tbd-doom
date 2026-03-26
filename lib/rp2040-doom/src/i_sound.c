@@ -364,7 +364,6 @@ int I_GetSfxLumpNum(should_be_const sfxinfo_t *sfxinfo)
 
 void I_UpdateSound(void)
 {
-    /*
     if (sound_module != NULL)
     {
         sound_module->Update();
@@ -374,7 +373,6 @@ void I_UpdateSound(void)
     {
         active_music_module->Poll();
     }
-    */
 }
 
 static void CheckVolumeSeparation(int *vol, int *sep)

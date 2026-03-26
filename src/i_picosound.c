@@ -15,7 +15,7 @@
 #include "w_wad.h"
 #include "doomtype.h"
 #include "pico_audio_bridge.h"
-//#include "p4_spi_transport.h"
+#include "p4_spi_transport.h"
 #include "picoflash.h"
 
 // ── ADPCM decoder (same as original i_picosound.c) ────────────────────
@@ -309,7 +309,7 @@ static void I_Pico_UpdateSound(void) {
     }
 
     // Drain ring buffer → SPI (word-clock paced)
-    //p4_spi_transport_poll();
+    p4_spi_transport_poll();
 }
 
 static void I_Pico_ShutdownSound(void) {
@@ -320,7 +320,7 @@ static void I_Pico_ShutdownSound(void) {
 static boolean I_Pico_InitSound(boolean _use_sfx_prefix) {
     use_sfx_prefix = _use_sfx_prefix;
     pab_init();
-    //p4_spi_transport_init();
+    p4_spi_transport_init();
     sound_initialized = true;
     printf("[DOOM] Sound initialized (SPI bridge, %d Hz)\n", PICO_SOUND_SAMPLE_FREQ);
     return true;

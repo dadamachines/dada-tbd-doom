@@ -140,10 +140,8 @@ static void pack_frame(uint8_t *buf) {
 
 // ── Blocking full-duplex SPI transfer via DMA ──────────────────────────
 static void spi_transfer_dma(const uint8_t *tx, uint8_t *rx, size_t len) {
-    // Wait for P4 ready (timeout after ~500 us to avoid deadlock)
-    uint32_t timeout = 7500;  // ~500 us at 150 MHz
-    while (!gpio_get(P4_RDY_PIN) && --timeout)
-        tight_loop_contents();
+    // Skip transfer entirely if P4 is not ready (avoids hang when P4 is off)
+    if (!gpio_get(P4_RDY_PIN)) return;
 
     gpio_put(P4_CS_PIN, 0);
 
