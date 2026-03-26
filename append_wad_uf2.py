@@ -23,6 +23,8 @@ UF2_MAGIC1 = 0x9E5D5157
 UF2_MAGIC_END = 0x0AB16F30
 UF2_FLAG_FAMILY = 0x00002000
 RP2350_FAMILY_ID = 0xE48BFF59
+DATA_FAMILY_ID = 0xE48BFF58
+ABSOLUTE_FAMILY_ID = 0xE48BFF57
 PAYLOAD_SIZE = 256
 BLOCK_SIZE = 512
 
@@ -138,10 +140,14 @@ try:
         print(f"  [WAD] Appending {os.path.basename(wad_path)} to UF2...")
         fw_blocks = read_uf2(uf2_path)
 
-        # Read family ID from first firmware block
-        family_id = struct.unpack_from("<I", fw_blocks[0], 28)[0]
+        # Re-stamp firmware blocks to ABSOLUTE family so all blocks
+        # (firmware + WAD) share the same family ID.  The "absolute"
+        # family tells the RP2350 bootloader to write each block to
+        # its stated flash address, bypassing partition routing.
+        for blk in fw_blocks:
+            struct.pack_into("<I", blk, 28, ABSOLUTE_FAMILY_ID)
 
-        wad_blocks = make_wad_blocks(wad_path, TINY_WAD_ADDR, family_id)
+        wad_blocks = make_wad_blocks(wad_path, TINY_WAD_ADDR, ABSOLUTE_FAMILY_ID)
         combine_uf2(fw_blocks, wad_blocks, uf2_path)
 
     env.AddPostAction(
@@ -165,6 +171,5 @@ if __name__ == "__main__":
     out_path = sys.argv[3] if len(sys.argv) > 3 else fw_path
 
     fw_blocks = read_uf2(fw_path)
-    family_id = struct.unpack_from("<I", fw_blocks[0], 28)[0]
-    wad_blocks = make_wad_blocks(wad_path, TINY_WAD_ADDR, family_id)
-    combine_uf2(fw_blocks, wad_blocks, out_path)
+    wad_blocks = make_wad_blocks(wad_path, TINY_WAD_ADDR, ABSOLUTE_FAMILY_ID)
+    combine_uf2(wad_blocks, fw_blocks, out_path)

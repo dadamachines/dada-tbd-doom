@@ -206,14 +206,17 @@ upload_protocol = cmsis-dap
 
 ### Flashing
 
-**Always use CMSIS-DAP debug probe:**
+**Recommended — CMSIS-DAP debug probe:**
 ```bash
-pio run -t upload
+./flash.sh all        # firmware + WAD via debug probe
+./flash.sh uf2        # combined UF2 via picotool USB
+pio run -t upload     # firmware only (no WAD!)
 ```
 
+**UF2 drag-and-drop** is not currently working — see **Section 9** for research details. Use `picotool` or the debug probe instead.
+
 **Never use:**
-- UF2 drag-and-drop (WAD data won't be placed correctly)
-- `idf.py flash` (wrong platform, causes boot loops on ESP-based boards)
+- `idf.py flash` (ESP32 tool, causes boot loops on ESP-based boards)
 - `esptool.py` (ESP32 tool, not applicable to RP2350)
 
 ### Command Reference
@@ -346,9 +349,78 @@ pio device monitor -e doom-tbd16
 - `DOOM_TINY` is designed for ~40KB — 170KB is plenty
 - Display frame buffers: 4 × 1024 bytes = 4KB static allocation on core 1's stack
 
-### Flash
-- Firmware + doom engine: ~250KB
-- `doom1.whx` (compressed WAD): appended after firmware by `append_wad_uf2.py`
+### Flash (16 MB W25Q080, XIP-mapped)
+
+The RP2350 memory-maps the entire 16 MB SPI flash via XIP (Execute In Place) starting at `XIP_BASE = 0x10000000`. All flash reads are transparent pointer dereferences — no explicit SPI transactions needed at runtime.
+
+#### Flash Memory Map
+
+```
+0x10000000  XIP_BASE ─── Bootloader + Firmware (~250 KB)
+0x10040000  ──────────── doom1.whx (compressed WAD) ← TINY_WAD_ADDR
+                         (variable size, ~500 KB for shareware)
+0x11000000  ──────────── End of 16 MB flash
+```
+
+#### WAD Address
+
+The WAD is placed at a fixed flash address defined in `platformio.ini`:
+
+```
+TINY_WAD_ADDR = 0x10040000
+```
+
+This is 256 KB (0x40000) past `XIP_BASE`, leaving room for the firmware binary. The address is used by both the build system (to place the data) and the runtime (to read it).
+
+#### WAD Format (WHX)
+
+The `doom1.whx` file is a compressed Doom WAD variant produced by `whd_gen`. It uses a packed lump table where each `lumpinfo_t` is a single `uint32_t` (offset only). Valid magic bytes: `IWAD`, `IWHD`, or `IWHX`.
+
+#### Build-Time: How the WAD Gets Into Flash
+
+The post-build script `append_wad_uf2.py` embeds the WAD into the firmware image:
+
+1. Reads `data/doom1.whx` and validates the WAD magic bytes
+2. Chunks the WAD into 256-byte payloads, wraps each in a UF2 block
+3. Sets the target address of each block to `0x10040000` + offset
+4. Appends these blocks after the firmware UF2 blocks
+5. Fixes up block sequence numbers across the combined file
+
+The result is a single UF2 file containing both firmware and WAD data. The CMSIS-DAP probe flashes each block to its target address.
+
+#### Runtime: How the WAD is Read
+
+The WAD is accessed via direct memory-mapped pointers in `w_file_memory.c`:
+
+```c
+#define wad_map_base ((const uint8_t *)TINY_WAD_ADDR)  // 0x10040000
+```
+
+The WAD file interface (`W_Memory_Read`) uses `memcpy` from this pointer:
+
+```c
+memcpy(buffer, wad->mapped + offset, buffer_len);
+```
+
+Individual lumps are accessed even more directly via `w_wad.h`:
+
+```c
+static inline uint8_t *lump_data(const lumpinfo_t *lump) {
+    return whd_map_base + ((*lump) & 0xffffff);
+}
+```
+
+This returns a raw pointer into XIP flash — lumps are used in-place with zero copying.
+
+#### Relevant Build Flags
+
+| Flag | Value | Purpose |
+|---|---|---|
+| `TINY_WAD_ADDR` | `0x10040000` | Flash address for WAD data |
+| `USE_MEMORY_WAD` | `1` | Enable memory-mapped WAD file interface |
+| `USE_WHD` | `1` | Enable compressed WHD/WHX format support |
+| `USE_MEMMAP_ONLY` | `1` | Force all lump access through XIP pointers |
+| `PICO_FLASH_SIZE_BYTES` | `16777216` | 16 MB total flash size |
 
 ---
 
@@ -426,6 +498,9 @@ From analyzing the original TBD-16 firmware (`tbd-pico-seq3`):
 | `gen_all_luts.py` | Generate all 4 gamma LUT variants for the dithering framework |
 | `gen_gamma.py` | Generate gamma correction tables |
 | `gen_lut.py` | General LUT generation utilities |
+| `append_wad_uf2.py` | Post-build: re-stamps firmware blocks to ABSOLUTE family + appends WAD blocks |
+| `flash.sh` | Multi-mode flash script (debug probe / picotool / UF2) |
+| `split_uf2.py` | Split combined UF2 into firmware-only and WAD-only files |
 | `check_uf2.py` | Validate UF2 file structure |
 | `compare_uf2.py` | Compare two UF2 files for differences |
 | `extract_fw.py` | Extract firmware from flash dumps |
@@ -433,8 +508,253 @@ From analyzing the original TBD-16 firmware (`tbd-pico-seq3`):
 
 ---
 
-## 9. Known Issues & Future Work
+## 9. UF2 Flashing Research & Status
 
+### Status: Drag-and-Drop Remains Unsolved
+
+**TLDR:** Drag-and-drop flashing of the combined firmware+WAD UF2 via RP2350 BOOTSEL mass-storage mode **does not work** despite extensive investigation. The `cp` command to `/Volumes/RP2350/` always exits with code 1 and the device fails to boot.
+
+**Working alternatives:**
+- `picotool load --ignore-partitions -v -x firmware.uf2` — **WORKS** (USB BOOTSEL mode)
+- CMSIS-DAP debug probe via `./flash.sh all` — **WORKS** (SWD)
+
+### The Core Problem
+
+The combined firmware+WAD UF2 is ~4 MB (~8018 blocks), spanning addresses `0x10000000`–`0x101F7800`. The RP2350 BOOTSEL mass-storage bootloader applies restrictions on which UF2 blocks it will accept. Multiple factors contribute:
+
+1. **Partition boundaries:** By default, the bootloader assumes a single small firmware partition. UF2 blocks targeting addresses outside known partitions are silently dropped.
+2. **Family ID routing:** The bootloader uses the UF2 family ID field (offset 28) to route blocks to partitions. If a partition's family list doesn't match the block's family, that block is ignored.
+3. **IMAGE_DEF requirement:** The bootloader requires an IMAGE_DEF/vector table to accept a UF2 and trigger reboot. Data-only UF2s are silently discarded.
+
+### Approaches Tried (All Failed for Drag-and-Drop)
+
+#### Attempt 1: Default Build (RP2350-ARM-S Family)
+
+PlatformIO produces firmware blocks with `RP2350_ARM_S` family (`0xE48BFF59`). WAD blocks appended with the same family. Expected the bootloader to write all blocks within its default partition range.
+
+**Result:** WAD blocks silently dropped — they target addresses beyond the default partition.
+
+#### Attempt 2: Separate WAD-Only UF2
+
+Created a WAD-only UF2 to flash independently (using `split_uf2.py`).
+
+**Result:** Rejected — no IMAGE_DEF/vector table means the bootloader ignores the entire UF2.
+
+#### Attempt 3: Partition Table with Both Partitions (Same Family)
+
+Created `partition_table.json` with two partitions — firmware (256K) and WAD (15872K) — both using `rp2350-arm-s` family. Embedded PT in firmware ELF via `picotool partition create`.
+
+```json
+{
+  "partitions": [
+    { "name": "Doom Firmware", "start": 0, "size": "256K", "families": ["rp2350-arm-s"] },
+    { "name": "WAD Data", "start": "256K", "size": "15872K", "families": ["rp2350-arm-s"],
+      "no_reboot_on_uf2_download": true }
+  ]
+}
+```
+
+**Result:** Failed. Per Pi engineer **kilograham** on the Raspberry Pi forums: when two partitions share the same family ID, the bootloader cannot distinguish which partition a block belongs to.
+
+#### Attempt 4: Partition Table with DATA Family for WAD
+
+Changed WAD partition to use `data` family (`0xE48BFF58`), WAD blocks stamped with DATA family.
+
+**Result:** Failed. The `cp` to `/Volumes/RP2350/` still exits with code 1.
+
+#### Attempt 5: ABSOLUTE Family for WAD, No WAD Partition
+
+Based on advice from Pi engineer **will-v-pi** (forum post t=388069): use the "absolute" UF2 family (`0xE48BFF57`) to write to stated flash addresses bypassing partition routing. Removed the WAD partition, kept only firmware partition, WAD blocks stamped ABSOLUTE. Ensured WAD blocks come first in the file.
+
+**Result:** Failed.
+
+#### Attempt 6: All Blocks ABSOLUTE Family with Partition Table
+
+Re-stamped ALL blocks (firmware + WAD) to ABSOLUTE family. Kept a single firmware partition with `"start": 0` to avoid the flip-flop bug (see below).
+
+**Result:** Failed.
+
+#### Attempt 7: All Blocks ABSOLUTE Family, No Partition Table (Current)
+
+Simplest possible approach: no partition table at all, all ~8018 blocks stamped with ABSOLUTE family (`0xE48BFF57`). The build script (`append_wad_uf2.py`) re-stamps firmware blocks from `RP2350_ARM_S` to `ABSOLUTE` and appends WAD blocks also as `ABSOLUTE`.
+
+**Result:** Failed. Verified via `picotool load --ignore-partitions` that the UF2 content is valid (device boots and runs correctly when flashed this way), but drag-and-drop still fails.
+
+### Key Research Findings
+
+#### Source 1: Raspberry Pi Forums (t=388069)
+
+Pi engineer **will-v-pi** on using multiple UF2 families:
+> "Use the absolute UF2 family to target absolute flash addresses, bypassing partition routing."
+
+Pi engineer **kilograham** warned:
+> "Concatenating multiple UF2s with different families is not strictly supported — the host OS may interleave sectors from different parts of the file, and the bootloader processes them in arrival order."
+
+**Implication:** Mixed-family UF2 files (e.g., firmware as `rp2350-arm-s` + WAD as `absolute`) may fail because macOS's FAT write implementation could interleave the 512-byte sectors unpredictably.
+
+#### Source 2: pico-sdk GitHub Issue #1882
+
+Pi engineer **will-v-pi** explained the **partition table flip-flop bug**: when `picotool partition create` embeds the PT, it places the PT section at the end of the firmware's flash region (e.g., `0x1003D8AC`). If partition 0 starts at the default address (`0x10002000`), the PT itself falls _outside_ partition 0's range. On first UF2 download, the PT writes correctly. On second download, the bootloader reads the now-existing PT, sees that the PT's own address is outside partition 0, and refuses to overwrite it — leaving stale PT data.
+
+**Fix:** Add `"start": 0` to partition 0 in the JSON so the partition covers the entire range from `0x10000000` including the PT section. This was applied in our attempts but did not resolve the drag-and-drop issue.
+
+#### Source 3: Pico W Reference Implementation (wifi_pt.json)
+
+The Pico W SDK uses a partition table with different families per partition:
+- Partition 0 (code): family `rp2350-arm-s`
+- Partition 1 (wifi firmware): family `cyw43-firmware` (`0xE48BFF55`)
+
+This is the canonical example of multi-partition UF2 — but the Pico W's second partition is much smaller and uses purpose-built tooling.
+
+#### Source 4: picotool partition create
+
+Command syntax (non-obvious argument order):
+```
+picotool partition create <json_input> <elf_output> -t elf <bootloader_elf_input> [--abs-block]
+```
+
+- Argument 2 is the **output** ELF (with embedded PT)
+- The `-t elf` input is the **source** firmware ELF
+- `--abs-block` adds an absolute block at `0x10FFFF00` for RP2350 errata E9
+
+**Gotcha:** If you convert the original ELF (not the output) to UF2, the PT is missing. And if you pass the same file as both input and output, the result is undefined.
+
+### UF2 Family ID Reference
+
+| Family ID | Constant | Hex | Purpose |
+|---|---|---|---|
+| Absolute | `ABSOLUTE_FAMILY_ID` | `0xE48BFF57` | Write to stated address, bypass partition routing |
+| Data | `DATA_FAMILY_ID` | `0xE48BFF58` | Generic data partitions |
+| RP2350 ARM-S | `RP2350_FAMILY_ID` | `0xE48BFF59` | RP2350 ARM Secure firmware (PlatformIO default) |
+| RP2350 ARM-NS | — | `0xE48BFF5A` | RP2350 ARM Non-Secure firmware |
+| RP2350 RISC-V | — | `0xE48BFF5B` | RP2350 RISC-V firmware |
+
+Source: `~/.platformio/packages/framework-picosdk/src/common/boot_uf2_headers/include/boot/uf2.h`
+
+### Current Build Pipeline
+
+The `append_wad_uf2.py` post-build script (current state — no partition table):
+
+1. PlatformIO builds `firmware.elf` → converts to `firmware.uf2` (family `RP2350_ARM_S`)
+2. Post-build reads `firmware.uf2`, re-stamps all firmware blocks to `ABSOLUTE_FAMILY_ID`
+3. Reads `data/doom1.whx`, creates WAD UF2 blocks at `TINY_WAD_ADDR` (`0x10040000`) with `ABSOLUTE_FAMILY_ID`
+4. Concatenates firmware + WAD blocks, fixes sequence numbers, writes combined `firmware.uf2`
+5. Result: ~8018 blocks, all `ABSOLUTE` family, addresses `0x10000000`–`0x101F7800`, ~4.1 MB
+
+### Flashing Methods
+
+#### Method 1: CMSIS-DAP Debug Probe (Recommended for Development)
+
+Direct SWD flashing — no partition restrictions, flashes firmware and WAD independently.
+
+```bash
+./flash.sh all        # Flash both firmware + WAD (default)
+./flash.sh firmware   # Flash firmware only (~250K, ~4 seconds)
+./flash.sh wad        # Flash WAD only (~1.8M, ~23 seconds)
+```
+
+Or via PlatformIO:
+```bash
+pio run -t upload     # Flash firmware only (no WAD!)
+```
+
+**Note:** `pio run -t upload` only flashes the firmware ELF. It does NOT include the WAD data. Use `./flash.sh all` for a complete flash.
+
+Uses OpenOCD with CMSIS-DAP interface:
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/rp2350.cfg -c "adapter speed 5000" \
+  -c "init" -c "reset halt" \
+  -c "flash write_image erase firmware.elf" \
+  -c "reset run" -c "shutdown"
+```
+
+#### Method 2: picotool via USB (Recommended for Production)
+
+Requires device in BOOTSEL mode (hold BOOT, press RESET). Flashes the combined firmware+WAD UF2:
+
+```bash
+./flash.sh uf2
+# or directly:
+picotool load --ignore-partitions -v -x firmware.uf2
+```
+
+The `--ignore-partitions` flag bypasses partition validation, allowing the entire combined UF2 to be written regardless of partition table state.
+
+#### Method 3: UF2 Drag-and-Drop (NOT WORKING)
+
+⚠️ **This method does not currently work.** See "Approaches Tried" above.
+
+The file `firmware.uf2` is a valid combined UF2 and flashes correctly via picotool, but fails when copied to the RP2350 BOOTSEL mass-storage volume:
+
+```bash
+# This fails with exit code 1:
+cp .pio/build/doom-tbd16/firmware.uf2 /Volumes/RP2350/
+```
+
+The volume name is **RP2350** (not RPI-RP2, which is the Pico 1 volume name).
+
+### UF2 File Format Reference
+
+Each UF2 block is exactly 512 bytes:
+
+| Offset | Size | Field | Value |
+|--------|------|-------|-------|
+| 0 | 4 | Magic 0 | `0x0A324655` ("UF2\n") |
+| 4 | 4 | Magic 1 | `0x9E5D5157` |
+| 8 | 4 | Flags | `0x00002000` (family ID present) |
+| 12 | 4 | Target Address | `0x10000000` + offset |
+| 16 | 4 | Payload Size | 256 (max) |
+| 20 | 4 | Block Number | Sequential (0-based) |
+| 24 | 4 | Total Blocks | Total count across all blocks |
+| 28 | 4 | Family ID | `0xE48BFF57` (Absolute) |
+| 32 | 256 | Data Payload | Firmware or WAD bytes |
+| 288 | 220 | Padding | Zeros |
+| 508 | 4 | Magic End | `0x0AB16F30` |
+
+### Utility Scripts
+
+| Script | Purpose |
+|---|---|
+| `append_wad_uf2.py` | Post-build: re-stamps firmware blocks to ABSOLUTE family + appends WAD blocks |
+| `flash.sh` | Multi-mode flash script (debug probe, picotool, UF2) |
+| `split_uf2.py` | Splits combined UF2 into firmware-only and WAD-only files |
+| `check_uf2.py` | Validates UF2 file structure and block integrity |
+| `compare_uf2.py` | Compares two UF2 files for differences |
+
+### Tool Versions
+
+| Tool | Version | Path |
+|---|---|---|
+| picotool | 5.140200.250530 | `~/.platformio/packages/tool-picotool-rp2040-earlephilhower/picotool` |
+| OpenOCD | 0.12.0+dev | `~/.platformio/packages/tool-openocd-rp2040-earlephilhower/bin/openocd` |
+| Pico SDK | 2.2.0 | `~/.platformio/packages/framework-picosdk/` |
+
+### Unexplored Avenues
+
+The following ideas have NOT been tested and may be worth investigating:
+
+1. **Firmware-only UF2 via drag-and-drop:** Test whether even a small firmware-only UF2 (no WAD, ~250K) works via mass storage. If not, the issue is not related to file size or WAD data at all — it could be a board-level USB or bootloader issue specific to the TBD-16 hardware.
+2. **File size limit:** The combined UF2 is ~4 MB. The RP2350 mass-storage bootloader may have undocumented transfer size limits.
+3. **macOS-specific behavior:** macOS `cp` to FAT volumes has known quirks (e.g., creating `._` resource fork files). Try from Linux or Windows.
+4. **Explicit eject:** After `cp`, run `diskutil eject /Volumes/RP2350` to ensure the FAT write completes before the device disconnects.
+5. **Board-specific USB:** The TBD-16 is a custom board, not a standard Pico 2. Its USB routing or power may affect BOOTSEL behavior.
+6. **picotool partition info on device:** Check what partition state the RP2350 boot ROM actually sees after various flash methods.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `cp firmware.uf2 /Volumes/RP2350/` exits with code 1 | **Unsolved** — see research above | Use `picotool load --ignore-partitions -v -x firmware.uf2` instead |
+| UF2 drag-and-drop: drive doesn't unmount after copy | UF2 has no IMAGE_DEF (e.g., WAD-only UF2) | Use combined firmware+WAD UF2, not WAD-only |
+| `picotool partition create` succeeds but PT missing in UF2 | Using wrong ELF for `uf2 convert` (the unmodified one) | Convert the OUTPUT ELF from `partition create`, not the original |
+| Build shows `[PT] WARNING: failed to embed partition table` | picotool not found or wrong arg order | Check picotool path; ensure `--abs-block` comes after bootloader ELF arg |
+| `picotool partition info` → "No accessible devices" | Device not in BOOTSEL mode, or running application | Hold BOOT + press RESET to enter BOOTSEL |
+
+---
+
+## 10. Known Issues & Future Work
+
+- **UF2 drag-and-drop:** Does not work — `cp firmware.uf2 /Volumes/RP2350/` fails with exit code 1. Seven different approaches tested (partition tables, family IDs, absolute addressing). Use `picotool load --ignore-partitions` or debug probe instead. See **Section 9** for full research.
 - **Audio:** Not implemented. Sound stubs exist (`i_picosound_stub.c`) but no I2S output to the audio codec.
 - **SPI speed:** 8 MHz works, 20-30 MHz causes blank screen on current hardware. May be fixable with better SPI signal integrity or slower ramp rates.
 - **UART debug:** UART1 TX on GPIO20 is wired to the debug probe but currently produces no output despite correct initialization. Suspected physical wire disconnection on the 4th SWD cable. The 3 SWD wires (SWDIO, SWCLK, GND) work for CMSIS-DAP flashing.
