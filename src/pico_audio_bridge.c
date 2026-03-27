@@ -16,12 +16,9 @@ static int16_t mix_pcm[MIX_BUF_SAMPLES * 2];     // stereo int16
 static audio_buffer_mem_t mix_mem;
 static audio_buffer_t mix_buf;
 
-// ── Resampler state (49716 → 44100 fixed-point) ───────────────────────
-// step = PAB_SOURCE_FREQ / PAB_TARGET_FREQ in 16.16 fixed point
-#define RESAMPLE_STEP ((uint32_t)((uint64_t)PAB_SOURCE_FREQ * 65536 / PAB_TARGET_FREQ))
-static uint32_t resample_frac = 0;  // fractional accumulator (0..65535)
+// ── Resampler removed — P4 handles resampling via cubic Hermite ────────
 
-// ── Test tone generator (440 Hz sine, bypasses ring buf + resampler) ──
+// ── Test tone generator (440 Hz sine, bypasses ring buf) ──────────────
 static bool test_tone_enabled = false;
 static uint32_t test_tone_phase = 0;
 
@@ -66,7 +63,6 @@ static inline uint32_t ring_free(void) {
 void pab_init(void) {
     ring_write = 0;
     ring_read  = 0;
-    resample_frac = 0;
     memset(ring, 0, sizeof(ring));
 
     mix_mem.bytes = (uint8_t *)mix_pcm;
@@ -109,82 +105,76 @@ void pab_give_buffer(audio_buffer_t *buf) {
 
 // Number of input samples (49716 Hz) needed to produce `out_count`
 // output samples (44100 Hz) with the current fractional state.
-static uint32_t input_needed(uint32_t out_count) {
-    // Each output sample advances the read pointer by RESAMPLE_STEP
-    // in 16.16 fixed point. We need the integer part sum + 1 for
-    // interpolation lookahead.
-    uint64_t total_frac = (uint64_t)resample_frac + (uint64_t)RESAMPLE_STEP * out_count;
-    return (uint32_t)(total_frac >> 16) + 1;  // +1 for interp lookahead
+// (Kept for test tone which still outputs at 44100 Hz with 32 samples)
+static uint32_t test_tone_input_needed(uint32_t out_count) {
+    return out_count;  // test tone is generated directly, no resampling
 }
 
 uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size) {
-    // Header: 4 (magic) + 4 (count) + PAB_SAMPLES_PER_FRAME*4 (stereo int16)
-    uint32_t payload_size = 8 + PAB_SAMPLES_PER_FRAME * 4;
-    if (buf_size < payload_size) return 0;
+    // PCM2 header: 4 (magic) + 2 (count) + 2 (source_rate_hz) + samples
+    // Max payload: 8 + 62*4 = 256 bytes (fits in synth_midi[256])
 
-    // ── Test tone mode: 440 Hz sine, bypasses ring buffer + resampler ──
+    // ── Test tone mode: 440 Hz sine, bypasses ring buffer ──
     if (test_tone_enabled) {
+        uint32_t count_out = 32;  // test tone at 44100 Hz, 32 samples
+        uint32_t payload_size = 8 + count_out * 4;
+        if (buf_size < payload_size) return 0;
+
         uint32_t magic = PAB_MAGIC;
-        uint32_t count = PAB_SAMPLES_PER_FRAME;
+        uint16_t count16 = (uint16_t)count_out;
+        uint16_t rate16 = 44100;  // test tone is already at 44100 Hz
         memcpy(synth_midi_buf, &magic, 4);
-        memcpy(synth_midi_buf + 4, &count, 4);
+        memcpy(synth_midi_buf + 4, &count16, 2);
+        memcpy(synth_midi_buf + 6, &rate16, 2);
 
         int16_t *out = (int16_t *)(synth_midi_buf + 8);
-        for (uint32_t i = 0; i < PAB_SAMPLES_PER_FRAME; i++) {
+        for (uint32_t i = 0; i < count_out; i++) {
             int16_t val = sine256((uint8_t)(test_tone_phase >> 24));
-            out[i * 2]     = val;  // L
-            out[i * 2 + 1] = val;  // R
+            out[i * 2]     = val;
+            out[i * 2 + 1] = val;
             test_tone_phase += TEST_TONE_PHASE_STEP;
         }
         return payload_size;
     }
 
+    // ── Normal mode: pack raw samples, no resampling ──
     uint32_t avail = ring_count();
-    uint32_t needed = input_needed(PAB_SAMPLES_PER_FRAME);
-    if (avail < needed) {
-        // Not enough samples — output silence frame
-        uint32_t magic = PAB_MAGIC;
-        uint32_t count = PAB_SAMPLES_PER_FRAME;
-        memcpy(synth_midi_buf, &magic, 4);
-        memcpy(synth_midi_buf + 4, &count, 4);
-        memset(synth_midi_buf + 8, 0, PAB_SAMPLES_PER_FRAME * 4);
-        return payload_size;
+    uint32_t count = avail < PAB_SAMPLES_PER_FRAME ? avail : PAB_SAMPLES_PER_FRAME;
+
+    if (count == 0) {
+        // Ring buffer empty — track underruns for diagnostics
+        static uint32_t underrun_count = 0;
+        static uint32_t underrun_report = 0;
+        underrun_count++;
+        underrun_report++;
+        if (underrun_report >= 5000) {  // every ~1 second at 5000 Hz ISR
+            printf("[PAB] underruns=%lu (ring empty)\n", (unsigned long)underrun_count);
+            underrun_report = 0;
+        }
+        return 0;
     }
 
-    // Resample with linear interpolation
+    uint32_t payload_size = 8 + count * 4;
+    if (buf_size < payload_size) return 0;
+
+    // Copy raw samples from ring buffer (no resampling)
     int16_t *out = (int16_t *)(synth_midi_buf + 8);
     uint32_t r = ring_read;
-    uint32_t frac = resample_frac;
-
-    for (uint32_t i = 0; i < PAB_SAMPLES_PER_FRAME; i++) {
-        uint32_t idx0 = r & PAB_RING_MASK;
-        uint32_t idx1 = (r + 1) & PAB_RING_MASK;
-        uint32_t f = frac >> 8;  // 8-bit fraction for lerp (0..255)
-
-        // Left channel
-        int32_t l0 = ring[idx0 * 2];
-        int32_t l1 = ring[idx1 * 2];
-        out[i * 2] = (int16_t)(l0 + ((l1 - l0) * (int32_t)f >> 8));
-
-        // Right channel
-        int32_t r0 = ring[idx0 * 2 + 1];
-        int32_t r1 = ring[idx1 * 2 + 1];
-        out[i * 2 + 1] = (int16_t)(r0 + ((r1 - r0) * (int32_t)f >> 8));
-
-        // Advance fractional position
-        frac += RESAMPLE_STEP;
-        r += (frac >> 16);
-        frac &= 0xFFFF;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t idx = r & PAB_RING_MASK;
+        out[i * 2]     = ring[idx * 2];
+        out[i * 2 + 1] = ring[idx * 2 + 1];
+        r++;
     }
-
     ring_read = r & PAB_RING_MASK;
-    resample_frac = frac;
 
-    // Write header
+    // Write PCM2 header
     uint32_t magic = PAB_MAGIC;
-    uint32_t count = PAB_SAMPLES_PER_FRAME;
+    uint16_t count16 = (uint16_t)count;
+    uint16_t rate16 = (uint16_t)PAB_SOURCE_FREQ;
     memcpy(synth_midi_buf, &magic, 4);
-    memcpy(synth_midi_buf + 4, &count, 4);
+    memcpy(synth_midi_buf + 4, &count16, 2);
+    memcpy(synth_midi_buf + 6, &rate16, 2);
 
     return payload_size;
 }

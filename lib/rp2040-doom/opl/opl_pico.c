@@ -263,6 +263,8 @@ void OPL_Pico_Mix_callback(audio_buffer_t *audio_buffer)
         }
         audio_buffer->sample_count = audio_buffer->max_sample_count;
 #if !USE_WOODY_OPL
+        // ×8 gain — matches original rp2040-doom.
+        // Wrapping in int16 is the original behavior.
         int16_t *samples = (int16_t *)audio_buffer->buffer->bytes;
         for(uint i=0;i<audio_buffer->sample_count * 2; i++) {
             samples[i] <<= 3;

@@ -48,6 +48,7 @@ struct channel_s {
     uint8_t decompressed_size;
 #if SOUND_LOW_PASS
     uint8_t alpha256;
+    int     lp_last_sample;   // persisted low-pass filter accumulator
 #endif
     int8_t decompressed[ADPCM_SAMPLES_PER_BLOCK_SIZE];
 };
@@ -166,8 +167,8 @@ static boolean init_channel_for_sfx(channel_t *ch, const sfxinfo_t *sfxinfo, int
     if (pitch == NORM_PITCH)
         ch->step = sample_freq * 65536 / PICO_SOUND_SAMPLE_FREQ;
     else
-        ch->step = (uint32_t)((sample_freq * pitch) * 65536ull /
-                              (PICO_SOUND_SAMPLE_FREQ * pitch));
+        ch->step = (uint32_t)((uint64_t)sample_freq * pitch * 65536u /
+                              ((uint64_t)PICO_SOUND_SAMPLE_FREQ * NORM_PITCH));
 
     decompress_buffer(ch);
     ch->offset = 0;
@@ -175,6 +176,7 @@ static boolean init_channel_for_sfx(channel_t *ch, const sfxinfo_t *sfxinfo, int
 #if SOUND_LOW_PASS
     ch->alpha256 = 256u * 201u * sample_freq /
                    (201u * sample_freq + 64u * (unsigned)PICO_SOUND_SAMPLE_FREQ);
+    ch->lp_last_sample = ch->decompressed[0];
 #endif
     return true;
 }
@@ -231,13 +233,25 @@ static boolean I_Pico_SoundIsPlaying(int channel) {
     return is_channel_playing(channel);
 }
 
+// Atomic flag to prevent Core 0 and Core 1 from calling the mixer
+// simultaneously.  Core 1 calls SafeUpdateSound() from pd_render.cpp
+// while waiting for semaphores (MULTICORE_RENDERING=1).
+// Uses __sync_lock_test_and_set (LDREX/STREX on Cortex-M33) which is
+// atomic across both cores via the global exclusive monitor.
+// Does NOT disable interrupts — the TIMER1 ISR must keep firing.
+static volatile uint32_t mix_lock_flag = 0;
+
 static void I_Pico_UpdateSound(void) {
     if (!sound_initialized) return;
 
+    // Atomic try-lock: sets flag to 1 and returns old value.
+    // If old value was 1 (other core holds it), skip this call.
+    if (__sync_lock_test_and_set(&mix_lock_flag, 1)) {
+        return;
+    }
+
     // Fill as many ring-buffer chunks as possible per call.
-    // The game loop runs at ~35fps but the SPI drain runs at ~1378 Hz
-    // consuming ~36 source samples each, so we must produce ~1400
-    // samples per frame to keep up.
+    // Called from BOTH cores (Core 1 via SafeUpdateSound during render).
     audio_buffer_t *buffer;
     while ((buffer = pab_take_buffer()) != NULL) {
         if (music_generator) {
@@ -246,6 +260,10 @@ static void I_Pico_UpdateSound(void) {
             memset(buffer->buffer->bytes, 0, buffer->buffer->size);
         }
 
+        // Music is already ×8 boosted (<<= 3 in opl_pico.c), matching
+        // the original rp2040-doom.  SFX are mixed directly into the
+        // same int16 buffer — exactly as the original does.  This
+        // preserves the correct music/SFX volume ratio.
         for (int ch = 0; ch < NUM_SOUND_CHANNELS; ch++) {
             if (!is_channel_playing(ch)) continue;
             channel_t *channel = &channels[ch];
@@ -258,7 +276,7 @@ static void I_Pico_UpdateSound(void) {
 #if SOUND_LOW_PASS
             int alpha256 = channel->alpha256;
             int beta256 = 256 - alpha256;
-            int sample = channel->decompressed[channel->offset >> 16];
+            int sample = channel->lp_last_sample;
 #endif
             for (uint32_t s = 0; s < buffer->max_sample_count; s++) {
 #if !SOUND_LOW_PASS
@@ -280,6 +298,9 @@ static void I_Pico_UpdateSound(void) {
                     }
                 }
             }
+#if SOUND_LOW_PASS
+            channel->lp_last_sample = sample;
+#endif
         }
 
         buffer->sample_count = buffer->max_sample_count;
@@ -310,7 +331,10 @@ static void I_Pico_UpdateSound(void) {
         pab_give_buffer(buffer);
     }
 
+    __sync_lock_release(&mix_lock_flag);
+
     // Drain ring buffer → SPI (word-clock paced)
+    // Only Core 0 should poll — Core 1 just fills the ring buffer.
     p4_spi_transport_poll();
 }
 
@@ -323,9 +347,8 @@ static boolean I_Pico_InitSound(boolean _use_sfx_prefix) {
     use_sfx_prefix = _use_sfx_prefix;
     pab_init();
 
-    // ── TEST TONE: ENABLED — 440Hz sine bypasses resampler ────
-    // Set to false to restore game audio.
-    pab_set_test_tone(true);
+    // Test tone: disabled. Enable with pab_set_test_tone(true) to debug.
+    // pab_set_test_tone(true);
 
     // P4 control link is initialized in sd_wad_loader.c after SD card release
 

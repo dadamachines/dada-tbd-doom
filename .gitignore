@@ -13,3 +13,6 @@ secrets.*
 .pioenvs
 .pio
 .env.DS_Store
+*.m4a
+*.wav
+tools/*.png

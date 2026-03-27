@@ -14,8 +14,8 @@ extern "C" {
 #endif
 
 // PCM transport magic — must match PicoAudioBridge plugin on P4
-#define PAB_MAGIC            0x50434D21  // "PCM!"
-#define PAB_SAMPLES_PER_FRAME 32         // Stereo pairs per SPI frame (BUF_SZ)
+#define PAB_MAGIC            0x50434D32  // "PCM2" — v2 with source_rate_hz
+#define PAB_SAMPLES_PER_FRAME 62         // Max stereo pairs per SPI frame (fills 256 bytes)
 
 // Ring buffer capacity in stereo sample pairs (power of 2)
 #define PAB_RING_SIZE 2048
@@ -23,8 +23,6 @@ extern "C" {
 
 // Source sample rate (set by the application, e.g. 49716 for Doom OPL)
 #define PAB_SOURCE_FREQ 49716
-// Target sample rate (P4 codec I2S)
-#define PAB_TARGET_FREQ 44100
 
 // Initialize the ring buffer. Call once at boot.
 void pab_init(void);
@@ -36,9 +34,9 @@ audio_buffer_t *pab_take_buffer(void);
 // Commit the filled buffer into the ring buffer.
 void pab_give_buffer(audio_buffer_t *buf);
 
-// Read PAB_SAMPLES_PER_FRAME stereo pairs from the ring buffer,
-// resampling PAB_SOURCE_FREQ → PAB_TARGET_FREQ, and pack them into
-// the given synth_midi[] region.
+// Read up to PAB_SAMPLES_PER_FRAME stereo pairs from the ring buffer
+// and pack them into the given synth_midi[] region as raw PCM2 frames
+// (no resampling — the P4 plugin handles that).
 // Returns the number of bytes written (header + PCM), or 0 on error.
 uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size);
 

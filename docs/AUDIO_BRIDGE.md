@@ -5,11 +5,12 @@
 The TBD-16 runs Doom on the RP2350B co-processor, but audio output is handled by
 the ESP32-P4 main processor through its TLV320AIC3254 codec (I2S, 44100 Hz,
 32-bit stereo, 32-sample blocks). The RP2350 generates Doom's OPL music and SFX
-at 49716 Hz, resamples to 44100 Hz, and streams 32-sample PCM frames over SPI1
-DMA to the P4 at ~1378 frames/sec.
+at 49716 Hz and streams raw PCM2 frames (up to 62 stereo pairs per SPI frame)
+over SPI1 DMA to the P4 at ~1400 frames/sec. The P4's PicoAudioBridge plugin
+resamples from 49716→44100 Hz using a cubic Hermite (Catmull-Rom) 4-tap
+resampler with adaptive rate matching.
 
-This document covers the full system architecture, current status, diagnosed
-bottleneck, and the path forward for both the RP2350 and P4 sides.
+This document covers the full system architecture and current status.
 
 ## System Architecture
 
@@ -85,8 +86,15 @@ bottleneck, and the path forward for both the RP2350 and P4 sides.
 `I_Pico_UpdateSound()` runs at ~35 fps in the Doom game loop and fills the ring
 buffer as fast as possible:
 
-- Calls OPL music generator → int16 stereo at 49716 Hz
-- Mixes ADPCM SFX channels (decompressed, pitch-shifted, stereo-panned)
+- Calls OPL music generator (EMU8950) → int16 stereo at 49716 Hz
+- **Widens to int32 with ×8 gain**: The OPL output is in int16 but quiet; the
+  ×8 boost (formerly `<<= 3` in int16 inside `opl_pico.c`, which caused
+  wrapping distortion) is now applied during int32 widening in `i_picosound.c`,
+  where there's 2 billion of headroom for safe accumulation.
+- Mixes ADPCM SFX channels (int8 decoded, pitch-shifted, stereo-panned) into
+  the int32 accumulator. SFX volume scaling: `sample * (vol / 2)` where sample
+  is int8 (±127) and vol is 0–255.
+- **Clamps int32 → int16** (saturating, never wraps)
 - Applies fade in/out
 - Pushes ~1400 stereo samples per frame into ring buffer via `pab_give_buffer()`
 - Calls `p4_spi_transport_poll()` (now only prints debug stats)
@@ -99,8 +107,10 @@ frame transmission independent of the game loop:
 1. Clears alarm interrupt, re-arms at `now + 200 µs`
 2. Checks if previous DMA is still busy → skip if yes
 3. Checks P4 handshake GPIO 22 (HIGH = ready) → skip if LOW
-4. `pack_frame()` → `pab_pack_spi()` reads 32 stereo samples from ring buffer,
-   resampling 49716→44100 Hz, packs into `p4_spi_request2.synth_midi[]`
+4. `pack_frame()` → `pab_pack_spi()` reads up to 62 raw stereo int16 samples
+   from the ring buffer (no resampling), packs into a PCM2 frame in
+   `p4_spi_request2.synth_midi[]`. Returns 0 if ring buffer is empty (skips
+   frame entirely to avoid injecting silence into P4 ring buffer).
 5. `start_dma()` → configures TX+RX DMA channels, triggers both simultaneously
 6. Returns immediately (DMA completes in background, ~164 µs)
 
@@ -113,12 +123,15 @@ and the next ISR invocation checks completion before sending again.
 
 1. **PrepareResponse**: Packs USB MIDI, waveforms, Ableton Link data
 2. **QueueBuffer**: Queues prepared response into SPI slave (sets handshake HIGH)
-3. **GetReceivedBuffer**: Waits for SPI slave transaction to complete (~364 µs blocking)
-4. **Validate**: Checks 0xCAFE watermark, CRC, sequence counter
-5. **Process**: Copies `synth_midi[]` → `pd.midi_bytes[]`, calls sound processors
-6. **Codec::ReadBuffer**: Reads 32 samples from I2S input
-7. **Sound processors**: `sp[0]->Process(pd)` — PicoAudioBridge extracts PCM
-8. **Codec::WriteBuffer**: Writes 32 samples to I2S output (~725 µs blocking)
+3. **Codec::WriteBuffer**: Writes 32 samples to I2S output (~725 µs blocking),
+   during which the SPI transfer from step 2 completes in parallel
+4. **GetReceivedBuffer**: SPI transaction should be complete by now (~364 µs)
+5. **Validate**: Checks 0xCAFE watermark, CRC, sequence counter
+6. **Process**: Copies `synth_midi[]` → `pd.midi_bytes[]`, calls sound processors
+7. **Codec::ReadBuffer**: Reads 32 samples from I2S input
+8. **Sound processors**: `sp[0]->Process(pd)` — PicoAudioBridge pushes PCM2
+   samples into its ring buffer, resamples 49716→44100 Hz via cubic Hermite,
+   outputs 32 float samples
 
 ## SPI Protocol
 
@@ -155,16 +168,28 @@ Simple additive checksum with seed 42, computed over the `p4_spi_request2` paylo
 
 ### PCM Payload in `synth_midi[256]`
 
+**PCM2 protocol** (current, used by dada-tbd-doom):
+
+```
+Offset  Size  Field
+0       4     PCM2 magic: 0x50434D32 ("PCM2")
+4       2     sample_count (uint16, 1-62 stereo pairs)
+6       2     source_rate_hz (uint16, e.g. 49716)
+8       N×4   N interleaved stereo int16 samples (L0 R0 L1 R1 ...)
+              N = sample_count, max 62 × 4 = 248 bytes
+```
+
+Max payload: 8 + 248 = 256 bytes (fills entire `synth_midi[]`).
+At full rate with 62 stereo pairs per frame at ~800 Hz effective: ~200 KB/s.
+
+**Legacy PCM! protocol** (backward compat, no longer sent):
+
 ```
 Offset  Size  Field
 0       4     PCM magic: 0x50434D21 ("PCM!")
 4       4     Sample count: 32
-8       128   32 interleaved stereo int16 samples (L0 R0 L1 R1 ...)
-136     120   Unused (zero)
+8       128   32 interleaved stereo int16 samples
 ```
-
-Total: 136 bytes of 256 available. 128 bytes of audio per frame =
-32 × 2 channels × 2 bytes = ~176 KB/s at full rate.
 
 ### SpiProtocolHelper State Machine (P4 side)
 
@@ -192,19 +217,48 @@ Sequence counters wrap 100→199 for both request and response.
 ## Resampling
 
 Doom with `USE_EMU8950_OPL=1` generates audio at **49716 Hz** (native OPL clock
-÷ 72). The TBD codec runs at **44100 Hz**. The ring buffer stores 49716 Hz
-samples; the SPI packer uses fixed-point linear interpolation:
+÷ 72). The TBD codec runs at **44100 Hz**.
 
-- Step = 49716 × 65536 / 44100 ≈ 73635 (16.16 fixed point)
-- Per frame: reads ~36 input samples, outputs 32 samples at 44100 Hz
-- Ring buffer: 2048 stereo pairs (power of 2 for fast masking, SPSC lock-free)
+### RP2350 Side — No Resampling
+
+The RP2350 sends raw 49716 Hz samples via PCM2 frames. No resampling on the
+RP2350 side. The ring buffer stores 49716 Hz stereo pairs (2048 pairs, power
+of 2 for fast masking, SPSC lock-free). `pab_pack_spi()` simply copies up to
+62 stereo pairs per frame from the ring buffer.
+
+When the ring buffer is empty, `pab_pack_spi()` returns 0 (no frame sent),
+avoiding the injection of zero-value samples that would disrupt the P4's
+resampler state.
+
+### P4 Side — Cubic Hermite Resampling
+
+The PicoAudioBridge plugin on P4 performs 49716→44100 Hz resampling using:
+
+- **Ring buffer**: 1024 stereo pairs with watermark pre-fill (128 pairs)
+- **Cubic Hermite (Catmull-Rom) 4-tap resampler**: Higher quality than linear
+  interpolation, uses 4 surrounding samples for smooth interpolation
+- **Adaptive rate matching**: Proportional control adjusts resample step based
+  on ring buffer fill level vs target (RING_WATERMARK = 128). This prevents
+  long-term drift between the 49716 Hz source and 44100 Hz output clocks.
+  Gain = 1/128 (subtle, prevents pitch wobble)
+- **Graceful underflow**: On ring buffer underrun, outputs available samples
+  without resetting resample fractional state, preserving phase continuity
+- **Overflow protection**: On ring_push overflow, drops oldest samples
 
 ## P4 Plugin: PicoAudioBridge
 
 - Stereo plugin (output only, no input processing)
 - No CV / TRIG (dummy entries only)
-- `Process()`: reads PCM from `data.midi_bytes`, converts int16→float, writes `data.buf`
-- If no PCM magic detected, outputs silence (graceful fallback)
+- `Process()`: Parses PCM2 header from `data.midi_bytes`, pushes stereo int16
+  samples into internal ring buffer (1024 pairs), resamples 49716→44100 Hz
+  via cubic Hermite interpolation, converts to float, writes `data.buf`
+- **Ring buffer watermark**: First 128 pairs must accumulate before output begins
+  (`pcm2_primed` flag). This absorbs SPI jitter and provides resampler lookahead.
+- **Adaptive rate matching**: Adjusts resample step proportionally based on
+  ring fill vs watermark target. Gain = 1/128.
+- **`pcm2_active` flag**: Once set, the plugin always drains its ring buffer
+  (even if current frame has no PCM2 data), preventing brief silence gaps.
+- If no PCM magic detected and not active, outputs silence (graceful fallback)
 - Registered via `SetActivePlugin(0, "PicoAudioBridge")` from RP2350 at boot
 - Block size: 32 stereo samples (BUF_SZ)
 
@@ -301,30 +355,30 @@ no `hardware/dma.h`, no `hardware/spi.h`.
 
 ---
 
-## Current Status: What Works
+## Current Status
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| PSRAM warm-boot | ✅ Working | Exit QPI + Reset + 200µs delay, 3 retries |
-| Ring buffer (SPSC) | ✅ Working | 2048 stereo pairs, lock-free, volatile indices |
-| Resampler (49716→44100) | ✅ Working | 16.16 fixed-point linear interpolation |
+| PSRAM warm-boot | ✅ Working | Exit QPI + Reset + 200µs delay, 3 retries (cold boot needed after debug probe reset) |
+| RP2350 ring buffer (SPSC) | ✅ Working | 2048 stereo pairs, lock-free, volatile indices |
+| PCM2 raw transport | ✅ Working | Up to 62 stereo pairs per frame, no RP2350-side resampling |
 | SPI1 DMA transport | ✅ Working | 25 MHz Mode 3, channels 4/5, 512-byte frames |
 | TIMER1 alarm ISR | ✅ Working | 5000 Hz, non-blocking, ~6% CPU |
-| Test tone generator | ✅ Working | 440 Hz sine, bypasses ring buf + resampler |
+| P4 pipeline reorder | ✅ Working | WriteBuffer before GetReceivedBuffer, ~1400 Hz throughput |
+| P4 cubic Hermite resampler | ✅ Working | 49716→44100 Hz, 4-tap Catmull-Rom |
+| P4 ring buffer (1024) | ✅ Working | Watermark 128, overflow protection, graceful underflow |
+| P4 adaptive rate matching | ✅ Working | Target=watermark, gain=1/128, prevents drift |
+| Int32 mixer | ✅ Working | Music ×8 gain + SFX mixed in int32, clamped to int16 |
+| OPL gain in int32 | ✅ Working | `<<= 3` removed from int16, now `* 8` in int32 widening |
+| SFX pitch correction | ✅ Working | Divides by NORM_PITCH (127), not by pitch (was no-op) |
+| Test tone generator | ✅ Working | 440 Hz sine, bypasses ring buffer |
 | P4 SPI slave receive | ✅ Working | Triple-buffered, handshake, CRC validation |
-| P4 PicoAudioBridge plugin | ✅ Working | int16→float conversion, silence fallback |
 | Control link (SPI0) | ✅ Working | SetActivePlugin at boot |
+| Skip empty frames | ✅ Working | `pab_pack_spi` returns 0 when ring empty |
+| SOUND_LOW_PASS filter | ✅ Enabled | IIR low-pass on SFX channels, `alpha256` per-channel |
 
-## Current Status: What Doesn't Work
-
-### Sound is Distorted — Root Cause Identified
-
-Even the pure 440 Hz test tone (which bypasses ring buffer and resampler) is
-distorted. The RP2350 timer ISR fires at 4755 Hz and the DMA + packing runs
-flawlessly, but the P4 only accepts frames at **678 Hz** — roughly half the
-1378 Hz required by its 44100 Hz / 32-sample codec.
-
-**The bottleneck is on the P4 side.**
+**Sound quality**: OK but not yet perfect — latest round of fixes (OPL gain
+overflow fix, SFX pitch fix) being tested.
 
 ---
 
@@ -706,6 +760,107 @@ After deploying the P4 fix, check the RP2350 debug output:
 - `sent` / time should approach 1378 Hz
 - Sound should be clean (test with 440 Hz test tone first)
 
+### Zero-Latency Alternative: Split Codec Write
+
+The pipeline reorder adds +0.726 ms because `Process(N)` output is written to
+the codec in iteration N+1. This is inherent to the reorder — you can't have
+`WriteBuffer` both before and after `Process` in the same iteration.
+
+However, on a **single core** with **zero added latency**, we can split
+`Codec::WriteBuffer` into two phases: **wait** (for previous DMA to finish) and
+**start** (submit new buffer to DMA). The I2S DMA hardware is double-buffered —
+`WriteBuffer` internally waits for a free slot, copies data, then the DMA sends
+it asynchronously. By separating these phases:
+
+```
+CURRENT (sequential):                    SPLIT-PHASE (zero latency):
+
+QueueBuf ──────┐                         PrepareResponse
+GetReceived ───┤ 364µs                   QueueBuffer ──────┐ RDY HIGH
+Process ───────┤ ~10µs                   WriteBufferWait ──┤ 725µs (prev DMA)
+Codec::Read ───┤ ~10µs                     (SPI runs during wait!)
+Codec::Write ──┤ 725µs                   GetReceivedBuffer ┤ SPI done
+               │                         extract_midi ─────┤
+Total: 1099µs                            Codec::ReadBuffer ┤ ~10µs
+                                         Process ──────────┤ output → fbuf
+                                         WriteBufferStart ─┤ starts DMA,
+                                                           │ returns immediately
+                                         Total: ~760µs (same throughput)
+```
+
+The key insight: `Process(N)` output goes to `WriteBufferStart(N)` in the
+**same iteration**, and the DMA finishes during `WriteBufferWait(N+1)`. So the
+audio is written with zero additional latency while SPI still overlaps with the
+codec DMA wait.
+
+```cpp
+while (runAudioTask) {
+    // 1. Prepare and queue SPI response
+    if (protocol.shouldPrepareNextResponse()) { ... }
+    if (protocol.shouldSendPreparedResponse()) {
+        QueueBuffer(sendbuffer);       // RDY goes HIGH
+        protocol.queuedPreparedResponse();
+    }
+
+    // 2. Wait for PREVIOUS I2S DMA to finish (~725µs)
+    //    SPI transfer runs during this wait!
+    Codec::WriteBufferWait();
+
+    // 3. SPI transfer should be complete — get new data
+    if (GetReceivedBuffer(&spi_request_ptr)) {
+        // validate, extract MIDI, mark request seen
+    }
+
+    taskYIELD();
+
+    // 4. Read input + process → output goes to fbuf
+    Codec::ReadBuffer(finput, BUF_SZ);
+    sp[0]->Process(pd);
+
+    // 5. Start new I2S DMA with THIS iteration's output (returns immediately)
+    Codec::WriteBufferStart(fbuf, BUF_SZ);
+}
+```
+
+#### What This Requires
+
+The `Codec` class needs a two-function API instead of the single `WriteBuffer`:
+
+```cpp
+// In Codec / I2S driver:
+void WriteBufferWait();                    // blocks until DMA slot is free
+void WriteBufferStart(float *buf, int n);  // copies to DMA buffer, starts transfer, returns
+
+// The existing single call is equivalent to:
+void WriteBuffer(float *buf, int n) {
+    WriteBufferWait();       // ← this is the 725µs block
+    WriteBufferStart(buf, n); // ← this returns quickly
+}
+```
+
+If the existing ESP-IDF I2S driver uses `i2s_channel_write()`, the wait and
+copy are already separable internally. The codec wrapper just needs to expose
+them as two entry points.
+
+#### Comparison
+
+| | Simple pipeline reorder | Split-phase codec write | Dual-core split |
+|--|--|--|--|
+| Added latency | +0.726 ms | **0 ms** | **0 ms** |
+| SPI throughput | ~1325 Hz | ~1325 Hz | ~2747 Hz |
+| Code complexity | 5-line reorder | Codec driver change | New FreeRTOS task, queue |
+| Thread safety | No concerns | No concerns | Shared state needs sync |
+| Risk | Minimal | Low (codec driver mod) | Medium (concurrency) |
+
+**Recommendation**: Try the simple pipeline reorder first (5 minutes to test,
+0.726 ms is inaudible). If zero latency is desired, the split-phase codec write
+is the cleanest single-core approach — it gives the same throughput improvement
+with zero added latency, requiring only a small codec driver refactor.
+
+The dual-core split (pinning SPI to core 1) is the nuclear option — highest
+throughput (~2747 Hz, nearly 2× headroom) and zero latency, but requires
+thread-safe access to the response buffer and protocol state.
+
 ---
 
 ## RP2350 Path Forward
@@ -790,20 +945,68 @@ At **800 Hz required**, even the *current* broken throughput of 678 Hz is only
   from the ring buffer directly. Write actual sample count in header.
 - Remove `RESAMPLE_STEP`, `resample_frac`, `input_needed()`.
 - Update `PAB_SAMPLES_PER_FRAME` from 32 to 62 (or make it dynamic).
+- Write source sample rate into the new header field (see protocol change below).
 
 **P4 changes** (`ctagSoundProcessorPicoAudioBridge.cpp`):
 - Add a small ring buffer (128–256 stereo pairs) inside the plugin.
-- `Process()`: Push received raw samples into ring buffer. Resample
-  49716→44100 Hz to produce exactly 32 output samples per `Process()` call.
+- `Process()`: Push received samples into ring buffer. Check `source_rate`:
+  - If `source_rate == 44100` (or 0): pull 32 samples directly, no resampling.
+  - If `source_rate != 44100`: resample from `source_rate` → 44100 Hz to
+    produce exactly 32 output samples per `Process()` call.
 - Fixed-point linear interpolation is sufficient (same as current RP2350 code),
   or upgrade to cubic/polyphase for better quality.
 - Persist resampler fractional state across `Process()` calls (class member).
+- Recompute `resample_step` only when `source_rate` changes (cache last value).
 
-**Protocol change** (`SpiProtocol.h`):
-- Change the PCM magic from `0x50434D21` ("PCM!") to a new value (e.g.,
-  `0x50434D32` — "PCM2") so the P4 plugin knows the payload contains raw
-  49716 Hz samples, not pre-resampled 44100 Hz. This ensures backward
-  compatibility during transition.
+**Protocol change** — PCM header v2 in `synth_midi[256]`:
+
+Keep the existing `PCM!` magic for backward compatibility (pre-resampled 44100,
+32 samples, no rate field). Introduce a new `PCM2` header that includes the
+source sample rate, making P4-side resampling automatic and optional:
+
+```
+PCM! header (current, unchanged):        PCM2 header (new):
+Offset  Size  Field                      Offset  Size  Field
+0       4     0x50434D21 ("PCM!")         0       4     0x50434D32 ("PCM2")
+4       4     sample_count: 32           4       2     sample_count (uint16, 1-62)
+8       128   32 stereo int16 samples    6       2     source_rate_hz (uint16)
+                                         8       N     N stereo int16 samples
+                                                       (N = sample_count × 4 bytes)
+```
+
+`source_rate_hz` is the actual sample rate in Hz (e.g. 49716, 44100, 48000).
+The uint16 range (0–65535) covers all practical audio sample rates.
+
+The plugin logic becomes:
+
+```cpp
+void Process(ProcessData &pd) {
+    uint32_t magic = *(uint32_t *)pd.midi_bytes;
+    if (magic == 0x50434D21) {  // "PCM!"
+        // Legacy: 32 pre-resampled 44100 Hz samples
+        copy_int16_to_float(pd.midi_bytes + 8, pd.buf, 32);
+    } else if (magic == 0x50434D32) {  // "PCM2"
+        uint16_t count = *(uint16_t *)(pd.midi_bytes + 4);
+        uint16_t rate  = *(uint16_t *)(pd.midi_bytes + 6);
+        push_ring_buffer(pd.midi_bytes + 8, count);
+        if (rate == 0 || rate == 44100) {
+            // No resampling needed — pull 32 samples directly
+            pull_ring_buffer(pd.buf, 32);
+        } else {
+            // Resample from source_rate → 44100
+            resample_pull(pd.buf, 32, rate, 44100);
+        }
+    }
+}
+```
+
+This means:
+- If the RP2350 sends 44100 Hz (pre-resampled), it uses `PCM2` with
+  `source_rate_hz = 44100` → plugin skips resampling, just buffers.
+- If the RP2350 sends 49716 Hz (raw OPL), it uses `PCM2` with
+  `source_rate_hz = 49716` → plugin resamples.
+- Old firmware sending `PCM!` still works unchanged (backward compat).
+- Any future source rate (48000 Hz, 32000 Hz) works without protocol changes.
 
 #### Risk Assessment
 
@@ -812,7 +1015,7 @@ At **800 Hz required**, even the *current* broken throughput of 678 Hz is only
   (61 or 62) depending on ring buffer fill level. The P4 plugin must handle
   variable-length input, which it already does via the sample count header field.
 - **Fallback**: If something goes wrong, revert to the current approach by
-  switching back to the old PCM magic. Both modes can coexist in the plugin.
+  switching back to the old `PCM!` magic. Both modes coexist in the plugin.
 
 ### Potential RP2350 Improvements (Lower Priority)
 
@@ -882,8 +1085,8 @@ Calculates rates, percentages, and identifies the dominant bottleneck.
 | `p4_spi_transport.h` | Transport API (`init`, `poll`) |
 | `p4_control_link.c` | SPI0 control channel (SetActivePlugin, etc.) |
 | `p4_control_link.h` | Control link API |
-| `pico_audio_bridge.c` | Ring buffer, resampler (49716→44100), PCM packer, test tone |
-| `pico_audio_bridge.h` | Bridge API, PCM magic, ring buffer constants |
+| `pico_audio_bridge.c` | Ring buffer (2048 stereo pairs), raw PCM2 packer (no resampling), test tone |
+| `pico_audio_bridge.h` | Bridge API, PCM2 magic (0x50434D32), ring buffer constants |
 | `SpiProtocol.h` | Frame structs (p4_spi_request_header, p4_spi_request2) |
 | `i_picosound.c` | Doom sound module → ring buffer → transport |
 | `psram_init.c` | PSRAM warm-boot recovery (QPI exit + reset sequence) |
@@ -897,7 +1100,8 @@ Calculates rates, percentages, and identifies the dominant bottleneck.
 | `main/SPManager.cpp` | Audio task: receive frames, validate, dispatch to plugins |
 | `main/SpiProtocol.h` | Shared frame structs (must match RP2350 side) |
 | `main/SpiProtocolHelper.cpp` | CRC validation, sequence tracking, state machine |
-| `components/ctagSoundProcessor/ctagSoundProcessorPicoAudioBridge.cpp` | PCM plugin |
+| `components/ctagSoundProcessor/ctagSoundProcessorPicoAudioBridge.cpp` | PCM2 plugin: ring buffer (1024), cubic Hermite resampler, adaptive rate matching |
+| `components/ctagSoundProcessor/ctagSoundProcessorPicoAudioBridge.hpp` | Plugin header: RING_SIZE, RING_WATERMARK, pcm2_active/primed flags |
 
 ### Tools
 

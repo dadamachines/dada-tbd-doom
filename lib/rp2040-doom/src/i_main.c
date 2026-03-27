@@ -68,12 +68,10 @@ int main(int argc, char **argv)
 #endif
 #if PICO_ON_DEVICE
     debug_uart_init();   // UART1 TX on GPIO20 → debug probe (before anything else)
-/*    
-    vreg_set_voltage(VREG_VOLTAGE_1_30);
-    // todo pause? is this the cause of the cold start isue?
 
-    set_sys_clock_khz(270000, true);
-*/
+    // RP2350 at default 150 MHz — no overclock needed.
+    // Cortex-M33 + FPU is much faster per-clock than the RP2040 M0+,
+    // and our 128×64 OLED render is far lighter than VGA color.
     power_on_logo();
     extern void debug_show_stage(int);
     debug_show_stage(1); // Stage 1: after power_on_logo
