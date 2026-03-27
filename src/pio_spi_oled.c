@@ -7,6 +7,7 @@
  * MOSI = GPIO 15 (OUT pin)
  */
 
+#include <stdio.h>          // MUST be first — avoids PSRAM init hang on RP2350
 #include "pio_spi_oled.h"
 #include "pio_spi_oled.pio.h"
 #include "hardware/pio.h"

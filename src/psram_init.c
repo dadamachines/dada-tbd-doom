@@ -11,6 +11,7 @@
  * XIP_BASE + 0x01000000 (0x11000000) and is directly read/writable.
  */
 
+#include <stdio.h>          // MUST be first — avoids PSRAM init hang on RP2350
 #include <stdint.h>
 #include <stddef.h>
 #include "hardware/address_mapped.h"

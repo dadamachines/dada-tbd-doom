@@ -3,10 +3,10 @@
 // This file exists because PlatformIO requires at least one source in src/
 // It is intentionally empty — do not add main() here.
 
+#include <stdio.h>          // MUST be first — avoids PSRAM init hang on RP2350
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 

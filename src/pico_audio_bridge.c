@@ -1,8 +1,9 @@
 // PicoAudioBridge — ring buffer, resampler, SPI PCM packer
 // See pico_audio_bridge.h for API.
 
-#include "pico_audio_bridge.h"
+#include <stdio.h>          // MUST be first — avoids PSRAM init hang on RP2350
 #include <string.h>
+#include "pico_audio_bridge.h"
 
 // ── Ring buffer (int16 stereo, interleaved L R L R …) ──────────────────
 static int16_t ring[PAB_RING_SIZE * 2];           // *2 for stereo
@@ -19,6 +20,40 @@ static audio_buffer_t mix_buf;
 // step = PAB_SOURCE_FREQ / PAB_TARGET_FREQ in 16.16 fixed point
 #define RESAMPLE_STEP ((uint32_t)((uint64_t)PAB_SOURCE_FREQ * 65536 / PAB_TARGET_FREQ))
 static uint32_t resample_frac = 0;  // fractional accumulator (0..65535)
+
+// ── Test tone generator (440 Hz sine, bypasses ring buf + resampler) ──
+static bool test_tone_enabled = false;
+static uint32_t test_tone_phase = 0;
+
+// Phase step for 440 Hz at 44100 Hz with 32-bit accumulator, 256-entry table:
+// step = 440 * 2^32 / 44100 = 42852277
+#define TEST_TONE_PHASE_STEP 42852277u
+
+// Quarter-wave sine table (64 entries, amplitude 20000)
+static const int16_t sine_qw[64] = {
+        0,   499,   997,  1495,  1991,  2487,  2981,  3473,
+     3963,  4450,  4935,  5417,  5895,  6370,  6840,  7307,
+     7769,  8226,  8678,  9124,  9565, 10000, 10429, 10851,
+    11266, 11675, 12076, 12470, 12856, 13234, 13603, 13965,
+    14317, 14661, 14996, 15321, 15637, 15943, 16239, 16525,
+    16801, 17066, 17321, 17564, 17797, 18019, 18230, 18430,
+    18617, 18794, 18959, 19111, 19252, 19382, 19499, 19603,
+    19696, 19777, 19845, 19901, 19944, 19975, 19994, 20000,
+};
+
+// Lookup full 256-point sine from quarter-wave table
+static inline int16_t sine256(uint8_t idx) {
+    if (idx < 64)  return  sine_qw[idx];
+    if (idx < 128) return  sine_qw[127 - idx];
+    if (idx < 192) return -sine_qw[idx - 128];
+    return                 -sine_qw[255 - idx];
+}
+
+void pab_set_test_tone(bool enable) {
+    test_tone_enabled = enable;
+    test_tone_phase = 0;
+    printf("[PAB] Test tone %s\n", enable ? "ENABLED (440 Hz sine)" : "disabled");
+}
 
 static inline uint32_t ring_count(void) {
     return (ring_write - ring_read) & PAB_RING_MASK;
@@ -86,6 +121,23 @@ uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size) {
     // Header: 4 (magic) + 4 (count) + PAB_SAMPLES_PER_FRAME*4 (stereo int16)
     uint32_t payload_size = 8 + PAB_SAMPLES_PER_FRAME * 4;
     if (buf_size < payload_size) return 0;
+
+    // ── Test tone mode: 440 Hz sine, bypasses ring buffer + resampler ──
+    if (test_tone_enabled) {
+        uint32_t magic = PAB_MAGIC;
+        uint32_t count = PAB_SAMPLES_PER_FRAME;
+        memcpy(synth_midi_buf, &magic, 4);
+        memcpy(synth_midi_buf + 4, &count, 4);
+
+        int16_t *out = (int16_t *)(synth_midi_buf + 8);
+        for (uint32_t i = 0; i < PAB_SAMPLES_PER_FRAME; i++) {
+            int16_t val = sine256((uint8_t)(test_tone_phase >> 24));
+            out[i * 2]     = val;  // L
+            out[i * 2 + 1] = val;  // R
+            test_tone_phase += TEST_TONE_PHASE_STEP;
+        }
+        return payload_size;
+    }
 
     uint32_t avail = ring_count();
     uint32_t needed = input_needed(PAB_SAMPLES_PER_FRAME);

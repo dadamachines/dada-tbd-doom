@@ -9,7 +9,7 @@ A port of [rp2040-doom](https://github.com/kilograham/rp2040-doom) to the [DaDa 
 | **MCU** | RP2350 (dual Cortex-M33, 150 MHz) |
 | **Display** | SSD1309 128x64 OLED, 2.4", monochrome, SPI1 at 8 MHz |
 | **Input** | STM32 UI board via I2C1 (D-pad, buttons, encoders) |
-| **Audio** | Not yet implemented (stubs present) |
+| **Audio** | Doom audio via SPI to P4 codec (PicoAudioBridge) — see [docs/AUDIO_BRIDGE.md](docs/AUDIO_BRIDGE.md) |
 | **PSRAM** | 8 MB APS6404 on QMI CS1 (GPIO19) |
 | **Storage** | Doom WAD loaded from SD card into PSRAM at boot |
 
@@ -47,13 +47,13 @@ The upstream [rp2040-doom](https://github.com/kilograham/rp2040-doom) targets th
 - **SSD1309 128x64** instead of SSD1306 72x40 (4x the pixels, different controller init)
 - **I2C button input** from STM32 UI board instead of direct GPIO
 - **PlatformIO build system** instead of CMake -- see platformio.ini and doom_build.py
-- **15 dithering algorithms** with compile-time switching -- see [DITHERING.md](DITHERING.md)
+- **15 dithering algorithms** with compile-time switching -- see [docs/DITHERING.md](docs/DITHERING.md)
 
 ### Display Rendering
 
 The original rp2040-doom switches between SSD1306 contrast levels to produce greyscale on a tiny 72x40. The SSD1309 on TBD-16 is a 2.4" panel with large visible pixels and no VSYNC signal -- the original approach caused heavy flickering and visible scanlines.
 
-The default renderer uses **Atkinson error-diffusion dithering** (mode 0), which produces clean surfaces with sharp edges. 14 other algorithms are available for comparison -- see [DITHERING.md](DITHERING.md) for the full list and build instructions.
+The default renderer uses **Atkinson error-diffusion dithering** (mode 0), which produces clean surfaces with sharp edges. 14 other algorithms are available for comparison -- see [docs/DITHERING.md](docs/DITHERING.md) for the full list and build instructions.
 
 A configurable **shadow-lift gamma LUT** opens up dark corridor areas common in Doom.
 
@@ -80,7 +80,7 @@ pio run
 pio run -t upload
 
 # Flash via debug probe (without rebuilding)
-./flash.sh firmware
+./tools/flash.sh firmware
 ```
 
 The firmware UF2 (~500 KB) can also be flashed via BOOTSEL drag-and-drop — see **Installation** above.
@@ -126,13 +126,20 @@ lib/
 data/
     doom1.whx           # Compressed Doom 1 shareware WAD
 
-gen_blue_noise2.py      # Blue noise texture generator (void-and-cluster, pure Python)
-gen_remap_lut.py        # Shadow-lift LUT generator
-MANUAL.md               # User manual -- controls, gameplay tips
-DITHERING.md            # Dithering algorithm reference and test log
-TECHNICAL.md            # Hardware architecture and engineering notes
-button-mapping.md       # I2C protocol and physical button layout
-pinmap.md               # Full hardware pin map (RP2350, ESP32-P4, STM32)
+docs/
+    AUDIO_BRIDGE.md     # Audio transport architecture (RP2350 → P4 codec)
+    DITHERING.md        # Dithering algorithm reference and test log
+    MANUAL.md           # User manual -- controls, gameplay tips
+    TECHNICAL.md        # Hardware architecture and engineering notes
+    button-mapping.md   # I2C protocol and physical button layout
+    pinmap.md           # Full hardware pin map (RP2350, ESP32-P4, STM32)
+
+tools/
+    gen_blue_noise2.py  # Blue noise texture generator (void-and-cluster)
+    gen_remap_lut.py    # Shadow-lift LUT generator
+    flash.sh            # Flash via debug probe
+    serial_capture.py   # UART debug capture
+    check_uf2.py        # UF2 file inspector
 ```
 
 ### Key Source Files
@@ -159,7 +166,7 @@ pinmap.md               # Full hardware pin map (RP2350, ESP32-P4, STM32)
 | S1 | Previous weapon |
 | S2 | Next weapon |
 
-See [MANUAL.md](MANUAL.md) for the full user manual and [button-mapping.md](button-mapping.md) for the hardware I2C protocol.
+See [docs/MANUAL.md](docs/MANUAL.md) for the full user manual and [docs/button-mapping.md](docs/button-mapping.md) for the hardware I2C protocol.
 
 ## Credits
 

@@ -45,6 +45,13 @@ uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size);
 // Number of stereo sample pairs currently in the ring buffer.
 uint32_t pab_available(void);
 
+// Enable/disable 440 Hz sine test tone.
+// When enabled, pab_pack_spi() generates a pure sine wave directly,
+// bypassing the ring buffer and resampler entirely.
+// Use this to isolate whether distortion is in the SPI/P4 chain
+// or in the audio pipeline (ring buffer / resampler).
+void pab_set_test_tone(bool enable);
+
 #ifdef __cplusplus
 }
 #endif

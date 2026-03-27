@@ -13,10 +13,10 @@
 
 #if USE_SD_WAD
 
+#include <stdio.h>          // MUST be first — avoids PSRAM init hang on RP2350
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <stdio.h>
 
 #include "hardware/gpio.h"
 #include "pico/platform.h"

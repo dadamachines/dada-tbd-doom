@@ -2,6 +2,7 @@
 // Based on rp2040-doom/src/pico/i_picosound.c but outputs via
 // pico_audio_bridge ring buffer → SPI → P4 plugin instead of I2S.
 
+#include <stdio.h>          // MUST be first — avoids PSRAM init hang on RP2350
 #include "config.h"
 
 #include <string.h>
@@ -321,6 +322,10 @@ static void I_Pico_ShutdownSound(void) {
 static boolean I_Pico_InitSound(boolean _use_sfx_prefix) {
     use_sfx_prefix = _use_sfx_prefix;
     pab_init();
+
+    // ── TEST TONE: disabled — real game audio flows through SPI/P4 ────
+    // Re-enable with pab_set_test_tone(true) to isolate SPI/P4 issues.
+    pab_set_test_tone(false);
 
     // P4 control link is initialized in sd_wad_loader.c after SD card release
 
