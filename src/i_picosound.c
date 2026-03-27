@@ -19,6 +19,9 @@
 //#include "p4_control_link.h"
 #include "p4_spi_transport.h"
 #include "picoflash.h"
+#if AUDIO_TEST_TONES
+#include <math.h>
+#endif
 
 // ── ADPCM decoder (same as original i_picosound.c) ────────────────────
 
@@ -233,6 +236,182 @@ static boolean I_Pico_SoundIsPlaying(int channel) {
     return is_channel_playing(channel);
 }
 
+// ── Test Tone Generator ──────────────────────────────────────────────
+// When AUDIO_TEST_TONES=1, replaces mixer output with a sequence of
+// known test signals.  Full chain exercised: ring buf → SPI → P4 AA →
+// resampler → ×8 gain → codec.  Record and analyze with
+// tools/analyze_test_tones.py.
+#if AUDIO_TEST_TONES
+
+#define TT_RATE    44100   // Match PAB_SOURCE_FREQ — no P4 resampling
+#define TT_2PI     6.28318530718f
+
+// Int16 amplitudes for specific dBFS levels.
+// P4 applies ×8 gain: clips when amp > 4096 (normalized > 0.125).
+#define TT_AMP_M30  1036    // -30 dBFS → ×8 = 0.25 (clean)
+#define TT_AMP_M24  2067    // -24 dBFS → ×8 = 0.50 (clean)
+#define TT_AMP_M18  4125    // -18 dBFS → ×8 = 1.01 (edge clip)
+#define TT_AMP_M12  8231    // -12 dBFS → ×8 = 2.01 (clips)
+
+enum {
+    TT_SYNC,            // 3 beeps at 2 kHz (alignment marker)
+    TT_SILENCE,         // Noise floor measurement
+    TT_1K_M30,          // 1 kHz -30 dBFS (clean, ×8 = 0.25)
+    TT_1K_M24,          // 1 kHz -24 dBFS (clean, ×8 = 0.50)
+    TT_1K_M18,          // 1 kHz -18 dBFS (edge of clipping)
+    TT_1K_M12,          // 1 kHz -12 dBFS (clipped by ×8)
+    TT_440_M24,         // 440 Hz -24 dBFS (tuning reference)
+    TT_SWEEP,           // Log sweep 100 Hz → 20 kHz -24 dBFS
+    TT_SQUARE_1K,       // 1 kHz square -24 dBFS (harmonics)
+    TT_IMD,             // 19 kHz + 20 kHz -30 dBFS each (AA test)
+    TT_IMPULSE,         // Impulse train 200 Hz -24 dBFS
+    TT_DONE
+};
+
+static const char *tt_names[] = {
+    "SYNC (3x beep 2kHz)",
+    "SILENCE",
+    "1kHz -30dBFS",
+    "1kHz -24dBFS",
+    "1kHz -18dBFS (clip edge)",
+    "1kHz -12dBFS (clips)",
+    "440Hz -24dBFS",
+    "SWEEP 100Hz-20kHz -24dBFS",
+    "SQUARE 1kHz -24dBFS",
+    "IMD 19k+20k -30dBFS",
+    "IMPULSE 200Hz -24dBFS",
+    "DONE (silence)"
+};
+
+static int tt_current = -1;
+static uint32_t tt_pos = 0;
+static uint32_t tt_total_samples = 0;
+static float tt_phase1 = 0.0f;
+static float tt_phase2 = 0.0f;
+static float tt_sweep_freq = 100.0f;
+static float tt_sweep_step = 1.0f;
+
+static uint32_t tt_duration(int phase) {
+    switch (phase) {
+        case TT_SYNC:   return TT_RATE * 1;        // 1 s
+        case TT_SWEEP:  return TT_RATE * 8;        // 8 s
+        default:        return TT_RATE * 4;        // 4 s
+    }
+}
+
+static void tt_advance_phase(void) {
+    tt_current++;
+    tt_pos = 0;
+    tt_phase1 = 0.0f;
+    tt_phase2 = 0.0f;
+    if (tt_current == TT_SWEEP) {
+        tt_sweep_freq = 100.0f;
+        tt_sweep_step = powf(20000.0f / 100.0f, 1.0f / (8.0f * TT_RATE));
+    }
+    if (tt_current <= TT_DONE) {
+        printf("[TT] Phase %d: %s (at sample %lu)\n",
+               tt_current, tt_names[tt_current],
+               (unsigned long)tt_total_samples);
+    }
+}
+
+static void tt_fill_buffer(int16_t *out, uint32_t count) {
+    if (tt_current < 0) {
+        tt_current = 0;
+        tt_pos = 0;
+        tt_total_samples = 0;
+        tt_phase1 = 0.0f;
+        tt_phase2 = 0.0f;
+        tt_sweep_freq = 100.0f;
+        printf("[TT] ═══ Audio Test Tone Sequence ═══\n");
+        printf("[TT] Rate: %d Hz, mono (L=R), ~45s total\n", TT_RATE);
+        printf("[TT] Phase 0: %s (at sample 0)\n", tt_names[0]);
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        int16_t val = 0;
+
+        switch (tt_current) {
+        case TT_SYNC: {
+            // 3 beeps: 100ms on, 100ms off, at 2 kHz, amplitude 2048
+            uint32_t seg = tt_pos / (TT_RATE / 10);
+            if (seg < 6 && (seg & 1) == 0) {
+                val = (int16_t)(2048.0f * sinf(tt_phase1 * TT_2PI));
+                tt_phase1 += 2000.0f / TT_RATE;
+                if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            }
+            break;
+        }
+        case TT_SILENCE:
+            break;
+        case TT_1K_M30:
+            val = (int16_t)((float)TT_AMP_M30 * sinf(tt_phase1 * TT_2PI));
+            tt_phase1 += 1000.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            break;
+        case TT_1K_M24:
+            val = (int16_t)((float)TT_AMP_M24 * sinf(tt_phase1 * TT_2PI));
+            tt_phase1 += 1000.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            break;
+        case TT_1K_M18:
+            val = (int16_t)((float)TT_AMP_M18 * sinf(tt_phase1 * TT_2PI));
+            tt_phase1 += 1000.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            break;
+        case TT_1K_M12:
+            val = (int16_t)((float)TT_AMP_M12 * sinf(tt_phase1 * TT_2PI));
+            tt_phase1 += 1000.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            break;
+        case TT_440_M24:
+            val = (int16_t)((float)TT_AMP_M24 * sinf(tt_phase1 * TT_2PI));
+            tt_phase1 += 440.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            break;
+        case TT_SWEEP:
+            val = (int16_t)((float)TT_AMP_M24 * sinf(tt_phase1 * TT_2PI));
+            tt_phase1 += tt_sweep_freq / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            tt_sweep_freq *= tt_sweep_step;
+            break;
+        case TT_SQUARE_1K:
+            val = (tt_phase1 < 0.5f) ? TT_AMP_M24 : -TT_AMP_M24;
+            tt_phase1 += 1000.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            break;
+        case TT_IMD: {
+            float s1 = (float)TT_AMP_M30 * sinf(tt_phase1 * TT_2PI);
+            float s2 = (float)TT_AMP_M30 * sinf(tt_phase2 * TT_2PI);
+            val = (int16_t)(s1 + s2);
+            tt_phase1 += 19000.0f / TT_RATE;
+            tt_phase2 += 20000.0f / TT_RATE;
+            if (tt_phase1 >= 1.0f) tt_phase1 -= 1.0f;
+            if (tt_phase2 >= 1.0f) tt_phase2 -= 1.0f;
+            break;
+        }
+        case TT_IMPULSE: {
+            uint32_t period = TT_RATE / 200;  // ~249 samples
+            if ((tt_pos % period) == 0) val = TT_AMP_M24;
+            break;
+        }
+        default:
+            break;
+        }
+
+        out[i * 2] = val;       // L
+        out[i * 2 + 1] = val;   // R (mono test)
+        tt_pos++;
+        tt_total_samples++;
+
+        if (tt_current < TT_DONE && tt_pos >= tt_duration(tt_current)) {
+            tt_advance_phase();
+        }
+    }
+}
+
+#endif // AUDIO_TEST_TONES
+
 // Atomic flag to prevent Core 0 and Core 1 from calling the mixer
 // simultaneously.  Core 1 calls SafeUpdateSound() from pd_render.cpp
 // while waiting for semaphores (MULTICORE_RENDERING=1).
@@ -254,6 +433,10 @@ static void I_Pico_UpdateSound(void) {
     // Called from BOTH cores (Core 1 via SafeUpdateSound during render).
     audio_buffer_t *buffer;
     while ((buffer = pab_take_buffer()) != NULL) {
+#if AUDIO_TEST_TONES
+        tt_fill_buffer((int16_t *)buffer->buffer->bytes, buffer->max_sample_count);
+        buffer->sample_count = buffer->max_sample_count;
+#else
         if (music_generator) {
             music_generator(buffer);
         } else {
@@ -327,6 +510,7 @@ static void I_Pico_UpdateSound(void) {
                 }
             }
         }
+#endif // AUDIO_TEST_TONES
 
         pab_give_buffer(buffer);
     }

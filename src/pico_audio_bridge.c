@@ -138,8 +138,26 @@ uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size) {
     }
 
     // ── Normal mode: pack raw samples, no resampling ──
+    // Determine the source rate for this frame
+#if AUDIO_TEST_TONES
+    uint16_t rate16 = 44100;
+#else
+    uint16_t rate16 = (uint16_t)PAB_SOURCE_FREQ;
+#endif
+
+    // Cap samples per frame to match P4 codec consumption rate.
+    // The P4 codec outputs 32 stereo pairs per I2S cycle at 44100 Hz,
+    // so it processes one SPI frame per cycle (44100/32 = 1378.125 Hz).
+    // Sending more samples than the P4 consumes per cycle overflows
+    // the P4 ring buffer, causing it to drop oldest samples and
+    // distort the audio (e.g. 1000 Hz appears as ~559 Hz).
+    // Target: source_rate * 32 / 44100 samples per frame.
+    uint32_t target_per_frame = ((uint32_t)rate16 * 32u) / 44100u;
+    if (target_per_frame < 1) target_per_frame = 1;
+    if (target_per_frame > PAB_SAMPLES_PER_FRAME) target_per_frame = PAB_SAMPLES_PER_FRAME;
+
     uint32_t avail = ring_count();
-    uint32_t count = avail < PAB_SAMPLES_PER_FRAME ? avail : PAB_SAMPLES_PER_FRAME;
+    uint32_t count = avail < target_per_frame ? avail : target_per_frame;
 
     if (count == 0) {
         // Ring buffer empty — track underruns for diagnostics
@@ -171,7 +189,6 @@ uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size) {
     // Write PCM2 header
     uint32_t magic = PAB_MAGIC;
     uint16_t count16 = (uint16_t)count;
-    uint16_t rate16 = (uint16_t)PAB_SOURCE_FREQ;
     memcpy(synth_midi_buf, &magic, 4);
     memcpy(synth_midi_buf + 4, &count16, 2);
     memcpy(synth_midi_buf + 6, &rate16, 2);

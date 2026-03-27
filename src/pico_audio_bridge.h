@@ -15,13 +15,14 @@ extern "C" {
 
 // PCM transport magic — must match PicoAudioBridge plugin on P4
 #define PAB_MAGIC            0x50434D32  // "PCM2" — v2 with source_rate_hz
-#define PAB_SAMPLES_PER_FRAME 62         // Max stereo pairs per SPI frame (fills 256 bytes)
+#define PAB_SAMPLES_PER_FRAME 62         // Absolute max stereo pairs per SPI frame (fills 256 bytes)
 
 // Ring buffer capacity in stereo sample pairs (power of 2)
 #define PAB_RING_SIZE 2048
 #define PAB_RING_MASK (PAB_RING_SIZE - 1)
 
-// Source sample rate (set by the application, e.g. 49716 for Doom OPL)
+// Source sample rate for normal Doom audio (OPL native clock ÷ 72).
+// The P4 resamples 49716 → 44100 Hz via cubic Hermite.
 #define PAB_SOURCE_FREQ 49716
 
 // Initialize the ring buffer. Call once at boot.
