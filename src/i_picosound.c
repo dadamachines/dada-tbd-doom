@@ -323,9 +323,9 @@ static boolean I_Pico_InitSound(boolean _use_sfx_prefix) {
     use_sfx_prefix = _use_sfx_prefix;
     pab_init();
 
-    // ── TEST TONE: disabled — real game audio flows through SPI/P4 ────
-    // Re-enable with pab_set_test_tone(true) to isolate SPI/P4 issues.
-    pab_set_test_tone(false);
+    // ── TEST TONE: ENABLED — 440Hz sine bypasses resampler ────
+    // Set to false to restore game audio.
+    pab_set_test_tone(true);
 
     // P4 control link is initialized in sd_wad_loader.c after SD card release
 

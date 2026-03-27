@@ -114,8 +114,36 @@ extern uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size);
 // P4 rp2350_spi_stream STREAM_BUFFER_SIZE_ = 512 — MUST match exactly!
 #define SPI_BUF_LEN  512
 
-// Max time to spend in poll() sending frames (µs)
-#define POLL_TIME_BUDGET_US  15000
+// ── TIMER1 alarm registers (use TIMER1 to avoid SDK alarm pool conflicts) ──
+#define TIMER1_BASE         0x400b8000
+#define TIMER_ALARM0        0x10
+#define TIMER_ARMED         0x20
+// TIMER_TIMERAWL already defined as 0x28
+#define TIMER_INTR          0x3c
+#define TIMER_INTE          0x40
+
+// Alarm period: check RDY ~4x per codec period for reliable catch.
+// P4 codec runs at 44100/32 = 1378 Hz (725 µs). Using 725 µs causes ~50%
+// phase-miss rate. At 200 µs (5000 Hz) we catch RDY within 1 tick.
+// ISR cost: ~12 µs per fire × 5000 = 6% CPU.
+#define ALARM_PERIOD_US     200
+
+// TIMER1 reset bit (bit 24 in RESETS register)
+#define RESETS_TIMER1_BIT   (1u << 24)
+
+// ── NVIC registers (ARM Cortex-M33 standard, per-core) ────────────────
+#define NVIC_ISER_ADDR      0xE000E100   // Interrupt Set-Enable
+#define NVIC_ICPR_ADDR      0xE000E280   // Interrupt Clear-Pending
+#define VTOR_ADDR           0xE000ED08   // Vector Table Offset Register
+
+// TIMER1_IRQ_0 on RP2350 = IRQ 4
+#define TIMER1_IRQ_NUM      4
+
+// ── TICKS generator (must enable for TIMER1 to count at 1 µs) ─────────
+#define TICKS_BASE              0x40108000
+#define TICKS_TIMER0_CYCLES     0x1c    // Already configured by SDK
+#define TICKS_TIMER1_CTRL       0x24
+#define TICKS_TIMER1_CYCLES     0x28
 
 // ── SPI buffers ────────────────────────────────────────────────────────
 static uint8_t tx_buf[SPI_BUF_LEN];
@@ -131,7 +159,10 @@ static uint32_t dma_tx_ctrl = 0;
 static uint32_t dma_rx_ctrl = 0;
 
 // ── Debug counters ─────────────────────────────────────────────────────
-static uint32_t dbg_frames_sent  = 0;
+static volatile uint32_t dbg_frames_sent  = 0;
+static volatile uint32_t dbg_isr_fires    = 0;   // total ISR invocations
+static volatile uint32_t dbg_isr_dma_busy = 0;   // skipped: DMA still running
+static volatile uint32_t dbg_isr_rdy_low  = 0;   // skipped: P4 not ready
 static uint32_t dbg_polls        = 0;
 
 // ── Protocol sequence counter (100-199, wrapping) ──────────────────────
@@ -143,11 +174,6 @@ static uint8_t seq_counter = 100;
 
 static inline uint32_t get_time_us(void) {
     return REG32(TIMER0_BASE, TIMER_TIMERAWL);
-}
-
-static inline void delay_us(uint32_t us) {
-    uint32_t start = get_time_us();
-    while (get_time_us() - start < us) {}
 }
 
 static inline int gpio_read_pin(uint32_t pin) {
@@ -173,11 +199,6 @@ static void gpio_set_input_pulldown(uint32_t pin) {
 // ── DMA helpers (matching DaDa_SPI::IsBusy / WaitUntilDMADoneBlocking) ─
 static inline int dma_is_busy(int chan) {
     return (REG32(DMA_BASE, chan * DMA_CH_STRIDE + DMA_CH_CTRL_TRIG) & DMA_CTRL_BUSY) != 0;
-}
-
-static inline void dma_wait_done(void) {
-    // DaDa_SPI: while(dma_channel_is_busy(tx) || dma_channel_is_busy(rx)) tight_loop_contents();
-    while (dma_is_busy(DMA_TX_CHAN) || dma_is_busy(DMA_RX_CHAN)) {}
 }
 
 static void spi1_unreset(void) {
@@ -245,34 +266,35 @@ static void pack_frame(void) {
     hdr->payload_crc = crc;
 }
 
-// ── TransferBlockingDelayed (matches DaDa_SPI exactly) ─────────────────
-// Returns 1 if frame was sent, 0 if P4 wasn't ready in time.
-static int send_frame_blocking(uint32_t timeout_us) {
-    // Step 1: WaitUntilDMADoneBlocking() — wait for any previous transfer
-    dma_wait_done();
+// ── Timer1 Alarm0 ISR — fires at ~1378 Hz to pace SPI frames ──────────
+// Runs on core0 (same as game loop). Ring buffer is safe: ISR only reads
+// ring_read, game loop only writes ring_write (SPSC, volatile indices).
+static void timer1_alarm0_isr(void) {
+    // Clear the alarm interrupt (write 1 to bit 0)
+    REG32(TIMER1_BASE, TIMER_INTR) = 1u;
 
-    // Step 2: WaitUntilP4IsReady() — poll handshake with timeout
-    uint32_t deadline = get_time_us() + timeout_us;
-    while (!gpio_read_pin(P4_RDY_PIN)) {
-        if ((int32_t)(get_time_us() - deadline) >= 0) {
-            return 0;  // P4 not ready — skip this frame
-        }
+    // Re-arm alarm for next tick (relative to now — no drift accumulation)
+    uint32_t now = REG32(TIMER1_BASE, TIMER_TIMERAWL);
+    REG32(TIMER1_BASE, TIMER_ALARM0) = now + ALARM_PERIOD_US;
+
+    dbg_isr_fires++;
+
+    // If previous DMA still running, skip this tick
+    if (dma_is_busy(DMA_TX_CHAN) || dma_is_busy(DMA_RX_CHAN)) {
+        dbg_isr_dma_busy++;
+        return;
     }
 
-    // Pack the frame just before sending
+    // If P4 not ready (handshake LOW), skip
+    if (!gpio_read_pin(P4_RDY_PIN)) {
+        dbg_isr_rdy_low++;
+        return;
+    }
+
+    // Pack and send (non-blocking — DMA completes in background)
     pack_frame();
-
-    // Step 3: StartDMA(tx_buf, rx_buf, len)
     start_dma(tx_buf, rx_buf, SPI_BUF_LEN);
-
-    // Step 4: WaitUntilDMADoneBlocking()
-    dma_wait_done();
-
-    // Step 5: Post-transfer delay (15 µs, matching DaDa_SPI default)
-    delay_us(15);
-
     dbg_frames_sent++;
-    return 1;
 }
 
 void p4_spi_transport_init(void) {
@@ -348,24 +370,49 @@ void p4_spi_transport_init(void) {
     printf("[P4-SPI] CTRL TX=0x%08lx RX=0x%08lx\n",
            (unsigned long)dma_tx_ctrl, (unsigned long)dma_rx_ctrl);
     printf("[P4-SPI] RDY pin %d reads: %d\n", P4_RDY_PIN, gpio_read_pin(P4_RDY_PIN));
+
+    // ── Set up TIMER1 alarm for periodic frame pacing ──────────────────
+    // Unreset TIMER1 (separate from TIMER0 used by SDK)
+    REG32(RESETS_BASE + RESETS_ATOMIC_CLR, RESETS_RESET) = RESETS_TIMER1_BIT;
+    while (!(REG32(RESETS_BASE, RESETS_RESET_DONE) & RESETS_TIMER1_BIT)) {}
+
+    // Enable TIMER1 tick generator — SDK only enables TIMER0's tick.
+    // Copy the same CYCLES value (12 for 12 MHz XOSC → 1 µs ticks).
+    uint32_t tick_cycles = REG32(TICKS_BASE, TICKS_TIMER0_CYCLES) & 0x1FF;
+    REG32(TICKS_BASE, TICKS_TIMER1_CYCLES) = tick_cycles;
+    REG32(TICKS_BASE, TICKS_TIMER1_CTRL) = 1u;  // ENABLE
+
+    printf("[P4-SPI] TIMER1 tick enabled (cycles=%lu)\n", (unsigned long)tick_cycles);
+
+    // Install ISR in RAM vector table
+    volatile uint32_t *vtable = (volatile uint32_t *)(*(volatile uint32_t *)VTOR_ADDR);
+    vtable[16 + TIMER1_IRQ_NUM] = (uint32_t)(uintptr_t)timer1_alarm0_isr;
+
+    // Clear any pending interrupt, then enable in NVIC
+    *(volatile uint32_t *)NVIC_ICPR_ADDR = (1u << TIMER1_IRQ_NUM);
+    *(volatile uint32_t *)NVIC_ISER_ADDR = (1u << TIMER1_IRQ_NUM);
+
+    // Enable TIMER1 ALARM0 interrupt
+    REG32(TIMER1_BASE, TIMER_INTE) = 1u;
+
+    // Arm first alarm
+    uint32_t t1_now = REG32(TIMER1_BASE, TIMER_TIMERAWL);
+    REG32(TIMER1_BASE, TIMER_ALARM0) = t1_now + ALARM_PERIOD_US;
+
+    printf("[P4-SPI] Timer1 alarm armed: %lu us period (~%lu Hz)\n",
+           (unsigned long)ALARM_PERIOD_US, 1000000UL / ALARM_PERIOD_US);
 }
 
 void p4_spi_transport_poll(void) {
-    uint32_t start = get_time_us();
-    uint32_t frames_this_poll = 0;
-
-    while ((get_time_us() - start) < POLL_TIME_BUDGET_US) {
-        if (!send_frame_blocking(500))  // 500 µs timeout per RDY wait
-            break;  // P4 not ready — exit early
-        frames_this_poll++;
-    }
-
-    // Print debug stats every ~2 seconds (~70 polls at ~30 fps)
+    // Frame sending is handled by TIMER1 alarm ISR at ~5000 Hz.
+    // This function just prints periodic debug stats.
     if (++dbg_polls >= 70) {
         dbg_polls = 0;
-        printf("[P4-SPI] sent=%lu this=%lu rdy=%d sr=0x%02lx\n",
-               (unsigned long)dbg_frames_sent, (unsigned long)frames_this_poll,
-               gpio_read_pin(P4_RDY_PIN),
-               (unsigned long)(REG32(SPI1_BASE, SPI_SSPSR) & 0xFF));
+        printf("[P4-SPI] sent=%lu isr=%lu dma_busy=%lu rdy_low=%lu rdy=%d\n",
+               (unsigned long)dbg_frames_sent,
+               (unsigned long)dbg_isr_fires,
+               (unsigned long)dbg_isr_dma_busy,
+               (unsigned long)dbg_isr_rdy_low,
+               gpio_read_pin(P4_RDY_PIN));
     }
 }
