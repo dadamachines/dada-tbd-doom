@@ -447,39 +447,86 @@ protocol helper, and codec I/O are 100% plugin-agnostic.
 
 ### Impact Analysis of Each Proposed P4 Change
 
-#### 1. Pipeline Fix (reorder audio_task loop) — ⚠️ AFFECTS ALL PLUGINS
+#### 1. Pipeline Fix (reorder audio_task loop) — SAFE FOR ALL PLUGINS
 
-This is the change that needs the most care. Moving `Codec::WriteBuffer` before
-`GetReceivedBuffer` changes the ordering for **every** plugin, not just
-PicoAudioBridge.
+**Do we need a mode switch?** No. The pipeline reorder is universally safe and
+even slightly beneficial for other plugins. Here's the detailed reasoning:
+
+##### What the reorder actually does
 
 **Current loop order** (all plugins see this):
 ```
-PrepareResponse → QueueBuffer → GetReceivedBuffer → [extract midi] →
-taskYIELD → Codec::ReadBuffer → sp[0]->Process → Codec::WriteBuffer
+PrepareResponse → QueueBuffer → GetReceivedBuffer(364µs) → [extract midi] →
+taskYIELD → Codec::ReadBuffer → sp[0]->Process → Codec::WriteBuffer(725µs)
+
+RDY is HIGH for ~200µs (between QueueBuffer and GetReceivedBuffer completing)
 ```
 
 **Proposed loop order**:
 ```
-PrepareResponse → QueueBuffer → Codec::WriteBuffer →
+PrepareResponse → QueueBuffer → Codec::WriteBuffer(725µs) →
 GetReceivedBuffer → [extract midi] → taskYIELD →
 Codec::ReadBuffer → sp[0]->Process
+
+RDY is HIGH for ~725µs (entire duration of Codec::WriteBuffer)
 ```
 
-**Impact on PicoSeqRack / seq3**: The reordering introduces **one codec block
-of latency** — the audio output from `Process()` at time N is written to the
-codec at time N+1 instead of time N. This adds 32/44100 = **0.726 ms** of
-latency. For a MIDI synthesizer, this is inaudible and well within acceptable
-bounds (human perception threshold for musical latency is ~5-10 ms).
+##### Why PicoSeqRack is UNAFFECTED
 
-**No functional breakage**: The data flow is identical — midi_bytes still arrive
-from `GetReceivedBuffer`, still get passed to `Process()`, the output still goes
-to `WriteBuffer`. Only the timing relationship between receive and output
-shifts by one block.
+1. **Data flow is identical**: MIDI bytes still arrive via `GetReceivedBuffer`,
+   still get copied to `pd.midi_bytes`, still get passed to `sp[0]->Process()`.
+   PicoSeqRack still parses note on/off, CC, pitch bend exactly the same way.
+   The synthesizer still produces audio into `fbuf`. Nothing changes about
+   *what* data goes where.
 
-**Recommendation**: This is safe for all plugins. One block of added latency
-is negligible for synth use cases. If needed, it could be made conditional on
-a config flag, but that adds complexity for no practical benefit.
+2. **+0.726 ms audio latency is inaudible**: The output from `Process()` at
+   iteration N is written to the codec at iteration N+1 instead of N. This
+   adds one codec block (32/44100 = 0.726 ms). Professional MIDI gear routinely
+   has 3-5 ms of latency. The human perception threshold is ~5-10 ms. This
+   increase is undetectable.
+
+3. **SPI reliability actually IMPROVES for seq3**: The current loop gives seq3
+   a ~200 µs RDY window to land its SPI frame. The proposed loop gives ~725 µs.
+   seq3 polls at ~1 ms intervals, so a larger window reduces the chance of
+   missing a poll cycle. This means seq3's MIDI delivery becomes *more* reliable,
+   not less.
+
+4. **MIDI is event-based, not continuous**: Unlike PCM audio (which needs 1378
+   frames/sec continuously), MIDI events are sparse. Missing one SPI frame just
+   means the MIDI event arrives in the next frame (~1 ms later). PicoSeqRack
+   already handles variable arrival timing gracefully.
+
+5. **Codec timing is unchanged**: `Codec::WriteBuffer` and `Codec::ReadBuffer`
+   are still called once per loop iteration, still process 32-sample blocks,
+   still run at 44100/32 = 1378 Hz. The I2S clock drives the loop rate
+   regardless of reordering.
+
+##### Why a mode switch would be WORSE
+
+A mode switch (e.g., `if (activePlugin == PicoAudioBridge) use_pipeline_order()`)
+would introduce:
+
+- **Two code paths** to test and maintain in the most timing-critical function
+- **Race condition risk** during plugin switching — what happens if SetActivePlugin
+  fires mid-loop and the flag changes between WriteBuffer and Process?
+- **Complexity for zero benefit** — since the reorder is safe for all plugins,
+  the conditional serves no purpose
+
+The reorder is the right approach. It should be unconditional.
+
+##### Verification for PicoSeqRack
+
+After deploying the pipeline change, test with seq3:
+- Play a sequence → verify all notes trigger correctly, no stuck notes
+- Check audio quality → should be identical (or imperceptibly better due to
+  improved SPI reliability)
+- Monitor P4 debug output → `parse-err` count should not increase
+- The +0.726 ms latency is below measurement threshold for manual testing
+
+**PrepareResponse is unaffected**: The response packing (USB MIDI, waveforms,
+Ableton Link data, LED status) runs before `QueueBuffer` in both the current and
+proposed loop orders. seq3 reads these response fields — they will continue to be
+populated correctly regardless of the reordering.
 
 #### 2. P4-Side Resampling (PicoAudioBridge plugin changes) — ✅ NO IMPACT
 
@@ -513,7 +560,7 @@ The triple-buffering, handshake GPIO, and DMA transaction handling are untouched
 
 | Change | Scope | PicoSeqRack Impact | PicoAudioBridge Impact | Other Plugins |
 |--------|-------|-------------------|----------------------|---------------|
-| Pipeline reorder | audio_task loop | +0.7ms latency (inaudible) | Fixes throughput | +0.7ms latency |
+| Pipeline reorder | audio_task loop | +0.7ms latency (inaudible), larger RDY window (better) | Fixes throughput | +0.7ms latency |
 | P4 resampler | PicoAudioBridge only | None | New capability | None |
 | New PCM magic | PicoAudioBridge only | None | Backward compat | None |
 | Ring buffer in plugin | PicoAudioBridge only | None | New capability | None |
