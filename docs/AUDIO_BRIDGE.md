@@ -29,8 +29,8 @@ This document covers the full system architecture and current status.
 │         │                   │        │     │                    │   │
 │  ISR reads ──────►          │        │     ├─ Codec::ReadBuffer │   │
 │         │                   │        │     ├─ sp[0]->Process()  │   │
-│  Resampler 49716→44100 Hz   │        │     ├─ Codec::WriteBuffer│   │
-│  (16.16 fixed-pt lerp)      │        │     │     (blocks ~725µs)│   │
+│  No resampling              │        │     ├─ Codec::WriteBuffer│   │
+│  (raw 49716 Hz to P4)       │        │     │     (blocks ~725µs)│   │
 │         │                   │        │     └────────────────────┘   │
 │  TIMER1 Alarm ISR (5000 Hz) │        │                              │
 │    pab_pack_spi() ─────┐    │        │  SPI2 Slave (triple-buffered)│
@@ -39,7 +39,7 @@ This document covers the full system architecture and current status.
 │         │              │    │ 25MHz  │         │                    │
 │    (non-blocking)      │    │ 512B   │         ▼                    │
 │                        │    │        │  PicoAudioBridge::Process()  │
-│  Game loop (~35 fps)   │    │        │    int16→float → pd.buf      │
+│  Game loop (~35 fps)   │    │        │    AA LPF → resample → ×8    │
 │    I_Pico_UpdateSound()│    │        │         │                    │
 │      fills ring buffer │    │        │         ▼                    │
 │                        │    │        │  TLV320AIC3254 Codec (I2S)   │
@@ -87,14 +87,17 @@ This document covers the full system architecture and current status.
 buffer as fast as possible:
 
 - Calls OPL music generator (EMU8950) → int16 stereo at 49716 Hz
-- **Widens to int32 with ×8 gain**: The OPL output is in int16 but quiet; the
-  ×8 boost (formerly `<<= 3` in int16 inside `opl_pico.c`, which caused
-  wrapping distortion) is now applied during int32 widening in `i_picosound.c`,
-  where there's 2 billion of headroom for safe accumulation.
-- Mixes ADPCM SFX channels (int8 decoded, pitch-shifted, stereo-panned) into
-  the int32 accumulator. SFX volume scaling: `sample * (vol / 2)` where sample
-  is int8 (±127) and vol is 0–255.
-- **Clamps int32 → int16** (saturating, never wraps)
+- **OPL ×8 gain** (`<<= 3` in `opl_pico.c`): Applied in-place on int16,
+  matching the original rp2040-doom exactly. Wraps on overflow (intentional —
+  the OPL output is quiet enough that wrapping rarely occurs at default music
+  volume).
+- Mixes ADPCM SFX channels (int8 decoded, pitch-shifted, stereo-panned)
+  additively into the same int16 buffer. SFX volume scaling:
+  `sample * (vol / 2)` where sample is int8 (±127) and vol is 0–255.
+  No clamping — additive mix wraps on int16 overflow (same as original).
+- **Multicore lock**: `__sync_lock_test_and_set` / `__sync_lock_release`
+  (LDREX/STREX atomics) prevents Core 0 and Core 1 from calling the mixer
+  simultaneously. Non-blocking try-lock — if held, the caller skips.
 - Applies fade in/out
 - Pushes ~1400 stereo samples per frame into ring buffer via `pab_give_buffer()`
 - Calls `p4_spi_transport_poll()` (now only prints debug stats)
@@ -234,13 +237,20 @@ resampler state.
 
 The PicoAudioBridge plugin on P4 performs 49716→44100 Hz resampling using:
 
-- **Ring buffer**: 1024 stereo pairs with watermark pre-fill (128 pairs)
+- **Ring buffer**: 4096 stereo pairs with watermark pre-fill (256 pairs)
+- **Anti-aliasing filter**: 2nd-order Butterworth biquad LPF at 20 kHz
+  (Q=0.7071, bilinear transform), applied per-channel in `ring_push()` before
+  storage. Prevents aliasing when decimating from 49716→44100 Hz.
 - **Cubic Hermite (Catmull-Rom) 4-tap resampler**: Higher quality than linear
-  interpolation, uses 4 surrounding samples for smooth interpolation
+  interpolation, uses 4 surrounding samples for smooth interpolation.
+  All arithmetic is **float** (no fixed-point).
 - **Adaptive rate matching**: Proportional control adjusts resample step based
-  on ring buffer fill level vs target (RING_WATERMARK = 128). This prevents
-  long-term drift between the 49716 Hz source and 44100 Hz output clocks.
-  Gain = 1/128 (subtle, prevents pitch wobble)
+  on ring buffer fill level vs target (RING_WATERMARK = 256):
+  `adjustment = fill_error * (0.005 / WATERMARK)`, clamped to ±5% of nominal.
+  Float precision eliminates the integer dead zone of fixed-point.
+- **Output gain**: ×8 linear gain with hard clamp at ±1.0. Brings the quiet
+  Doom mixer output (~12% of full scale) to proper DAC level without
+  waveshaping. Combined with OPL's `<<= 3`, total gain is ×64.
 - **Graceful underflow**: On ring buffer underrun, outputs available samples
   without resetting resample fractional state, preserving phase continuity
 - **Overflow protection**: On ring_push overflow, drops oldest samples
@@ -250,12 +260,13 @@ The PicoAudioBridge plugin on P4 performs 49716→44100 Hz resampling using:
 - Stereo plugin (output only, no input processing)
 - No CV / TRIG (dummy entries only)
 - `Process()`: Parses PCM2 header from `data.midi_bytes`, pushes stereo int16
-  samples into internal ring buffer (1024 pairs), resamples 49716→44100 Hz
-  via cubic Hermite interpolation, converts to float, writes `data.buf`
-- **Ring buffer watermark**: First 128 pairs must accumulate before output begins
+  samples through anti-aliasing biquad LPF into internal ring buffer (4096
+  pairs), resamples 49716→44100 Hz via float cubic Hermite interpolation,
+  applies ×8 linear gain with hard clamp, writes `data.buf`
+- **Ring buffer watermark**: First 256 pairs must accumulate before output begins
   (`pcm2_primed` flag). This absorbs SPI jitter and provides resampler lookahead.
 - **Adaptive rate matching**: Adjusts resample step proportionally based on
-  ring fill vs watermark target. Gain = 1/128.
+  ring fill vs watermark target. Gain = 0.005/WATERMARK, clamped ±5%.
 - **`pcm2_active` flag**: Once set, the plugin always drains its ring buffer
   (even if current frame has no PCM2 data), preventing brief silence gaps.
 - If no PCM magic detected and not active, outputs silence (graceful fallback)
@@ -272,8 +283,8 @@ When enabled, `pab_pack_spi()` generates a pure sine wave directly,
 bypassing the ring buffer and resampler. Use this to isolate whether
 distortion is in the SPI/P4 chain or in the audio pipeline.
 
-**Current finding**: The test tone is also distorted, proving the problem is in
-the SPI transport timing / P4 receive rate, not in the audio pipeline.
+The test tone bypasses the OPL and SFX mixer entirely, useful for isolating
+whether issues are in the SPI/P4 chain or in the audio pipeline.
 
 ## RP2350 Timer ISR Transport
 
@@ -366,19 +377,22 @@ no `hardware/dma.h`, no `hardware/spi.h`.
 | TIMER1 alarm ISR | ✅ Working | 5000 Hz, non-blocking, ~6% CPU |
 | P4 pipeline reorder | ✅ Working | WriteBuffer before GetReceivedBuffer, ~1400 Hz throughput |
 | P4 cubic Hermite resampler | ✅ Working | 49716→44100 Hz, 4-tap Catmull-Rom |
-| P4 ring buffer (1024) | ✅ Working | Watermark 128, overflow protection, graceful underflow |
-| P4 adaptive rate matching | ✅ Working | Target=watermark, gain=1/128, prevents drift |
-| Int32 mixer | ✅ Working | Music ×8 gain + SFX mixed in int32, clamped to int16 |
-| OPL gain in int32 | ✅ Working | `<<= 3` removed from int16, now `* 8` in int32 widening |
+| P4 anti-aliasing filter | ✅ Working | 2nd-order Butterworth biquad LPF at 20 kHz |
+| P4 ring buffer (4096) | ✅ Working | Watermark 256, overflow protection, graceful underflow |
+| P4 adaptive rate matching | ✅ Working | Float precision, gain=0.005/WATERMARK, ±5% clamp |
+| P4 output gain (×8 linear) | ✅ Working | Hard clamp ±1.0, total chain gain ×64 |
+| Int16 mixer | ✅ Working | Same as original: `<<= 3` in OPL + additive SFX, wraps |
+| Multicore atomic lock | ✅ Working | LDREX/STREX try-lock, non-blocking, both cores safe |
 | SFX pitch correction | ✅ Working | Divides by NORM_PITCH (127), not by pitch (was no-op) |
 | Test tone generator | ✅ Working | 440 Hz sine, bypasses ring buffer |
 | P4 SPI slave receive | ✅ Working | Triple-buffered, handshake, CRC validation |
 | Control link (SPI0) | ✅ Working | SetActivePlugin at boot |
 | Skip empty frames | ✅ Working | `pab_pack_spi` returns 0 when ring empty |
-| SOUND_LOW_PASS filter | ✅ Enabled | IIR low-pass on SFX channels, `alpha256` per-channel |
+| SOUND_LOW_PASS filter | ❌ Disabled | Was too aggressive (558 Hz cutoff); Graham: "didn't produce any noticeable improvement" |
 
-**Sound quality**: OK but not yet perfect — latest round of fixes (OPL gain
-overflow fix, SFX pitch fix) being tested.
+**Sound quality**: Close to original. Linear gain chain matches rp2040-doom
+character. Remaining difference: 49716→44100 Hz resampling (unavoidable with
+TLV320 codec).
 
 ---
 
