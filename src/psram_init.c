@@ -11,6 +11,7 @@
  * XIP_BASE + 0x01000000 (0x11000000) and is directly read/writable.
  */
 
+#include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 #include "hardware/address_mapped.h"
@@ -43,6 +44,21 @@ static int __no_inline_not_in_flash_func(qmi_wait_busy)(int timeout) {
     return 1;  /* timed out */
 }
 
+/* Wait for TX FIFO empty with timeout. Returns 0 if ok, 1 if timed out. */
+static int __no_inline_not_in_flash_func(qmi_wait_txempty)(int timeout) {
+    for (int i = 0; i < timeout; i++) {
+        if (qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS)
+            return 0;
+    }
+    return 1;  /* timed out */
+}
+
+/* Drain any stale data from the QMI RX FIFO (max 16 reads to prevent hang) */
+static void __no_inline_not_in_flash_func(qmi_drain_rx)(void) {
+    for (int i = 0; i < 16 && !(qmi_hw->direct_csr & QMI_DIRECT_CSR_RXEMPTY_BITS); i++)
+        (void)qmi_hw->direct_rx;
+}
+
 /* RAM-safe delay: ~1µs per 150 iterations at 150 MHz */
 static void __no_inline_not_in_flash_func(psram_delay_us)(int us) {
     for (volatile int d = 0; d < us * 150; d++) {}
@@ -56,10 +72,34 @@ static void __no_inline_not_in_flash_func(psram_cmd_spi)(uint8_t cmd) {
     qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
 }
 
+/* Send a single QPI command to CS1 (quad-width, no response expected) */
+static void __no_inline_not_in_flash_func(psram_cmd_qpi)(uint8_t cmd) {
+    qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+    qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS |
+                         QMI_DIRECT_TX_NOPUSH_BITS |
+                         QMI_DIRECT_TX_IWIDTH_VALUE_Q << QMI_DIRECT_TX_IWIDTH_LSB |
+                         cmd;
+    qmi_wait_busy(100000);
+    qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+}
+
 static size_t __no_inline_not_in_flash_func(psram_detect)(void) {
     int psram_size = 0;
 
-    /* Try and read the PSRAM ID via direct_csr */
+    /* Force-clear direct mode in case it was left enabled from a previous
+     * aborted boot (QMI is NOT reset by SYSRESETREQ). */
+    qmi_hw->direct_csr = 0;
+
+    /* Clear stale M[1] XIP configuration from previous boot.
+     * Without this, the QMI may try to complete an old XIP transfer
+     * when we enter direct mode, causing BUSY to stick. */
+    qmi_hw->m[1].timing = QMI_M1_TIMING_RESET;
+    qmi_hw->m[1].rfmt = 0;
+    qmi_hw->m[1].rcmd = 0;
+    qmi_hw->m[1].wfmt = 0;
+    qmi_hw->m[1].wcmd = 0;
+
+    /* Enter direct mode with slow clock for reliability */
     qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
 
     /* Wait for cooldown on last XIP transfer (with timeout) */
@@ -68,34 +108,60 @@ static size_t __no_inline_not_in_flash_func(psram_detect)(void) {
         return 0;
     }
 
-    /* === Warm-boot recovery sequence for APS6404 ===
-     * On warm boot / debug-probe reset, the PSRAM chip retains its state
-     * from the previous boot.  It may be stuck in QPI mode or mid-transaction.
-     * The upstream MicroPython code only sends Exit-QPI (0xF5), which fails
-     * if the chip is stuck mid-transaction.  We add a full reset sequence:
-     *   1. Exit QPI (0xF5) in quad mode — works if chip is in QPI mode
-     *   2. Reset Enable (0x66) in SPI mode — works in SPI mode
-     *   3. Reset (0x99) in SPI mode — full chip reset
-     *   4. Wait tRST (~100µs) for reset to complete
+    /* === Warm-boot recovery for APS6404 ===
+     * After debug-probe reset the RP2350 resets but the PSRAM retains
+     * its state (may be in QPI mode, mid-transaction, or continuous read).
+     *
+     * Strategy: we don't know if it's in SPI or QPI mode, so we reset
+     * in BOTH modes. Reset Enable (0x66) + Reset (0x99) work in both
+     * SPI and QPI modes per the APS6404 datasheet. After reset, the
+     * device always returns to SPI mode.
+     *
+     *   1. Drain RX FIFO
+     *   2. CS toggle + 32 dummy 0xFF in quad mode (flush any mid-transaction)
+     *   3. CS toggle
+     *   4. Reset Enable (0x66) in QPI mode
+     *   5. Reset (0x99) in QPI mode
+     *   6. Wait tRST (200µs)
+     *   7. Reset Enable (0x66) in SPI mode
+     *   8. Reset (0x99) in SPI mode
+     *   9. Wait tRST (200µs)
      */
 
-    /* 1. Exit QPI mode (0xF5 sent as quad) */
+    /* 1. Drain stale RX data */
+    qmi_drain_rx();
+
+    /* 2-3. Abort any mid-transaction with CS toggle + dummy clocks.
+     * Send with OE + QUAD width so all 4 SIO pins are driven HIGH —
+     * this properly flushes QPI-mode transactions (not just SPI). */
     qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
-    qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS |
-                         QMI_DIRECT_TX_IWIDTH_VALUE_Q << QMI_DIRECT_TX_IWIDTH_LSB |
-                         0xf5;
-    qmi_wait_busy(100000);
-    (void)qmi_hw->direct_rx;
+    for (int i = 0; i < 32; i++) {
+        qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS |
+                             QMI_DIRECT_TX_NOPUSH_BITS |
+                             QMI_DIRECT_TX_IWIDTH_VALUE_Q << QMI_DIRECT_TX_IWIDTH_LSB |
+                             0xFF;
+        qmi_wait_busy(100000);
+    }
+    qmi_drain_rx();
     qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+    psram_delay_us(50);
 
-    /* 2. Reset Enable (0x66) in SPI mode */
-    psram_cmd_spi(0x66);
+    /* 4-5. Reset in QPI mode (in case PSRAM is in QPI) */
+    psram_cmd_qpi(0x66);  /* Reset Enable */
+    psram_cmd_qpi(0x99);  /* Reset */
 
-    /* 3. Reset (0x99) in SPI mode */
-    psram_cmd_spi(0x99);
-
-    /* 4. Wait for chip reset to complete (tRST ≈ 100µs for APS6404) */
+    /* 6. Wait for reset to complete */
     psram_delay_us(200);
+
+    /* 7-8. Reset in SPI mode (in case PSRAM was in SPI, or QPI reset worked) */
+    psram_cmd_spi(0x66);  /* Reset Enable */
+    psram_cmd_spi(0x99);  /* Reset */
+
+    /* 9. Wait for reset to complete */
+    psram_delay_us(200);
+
+    /* Final drain before ID read */
+    qmi_drain_rx();
 
     /* Read the ID */
     qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
@@ -109,7 +175,9 @@ static size_t __no_inline_not_in_flash_func(psram_detect)(void) {
             qmi_hw->direct_tx = 0xff;
         }
 
-        while ((qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS) == 0) {
+        if (qmi_wait_txempty(100000)) {
+            qmi_hw->direct_csr &= ~(QMI_DIRECT_CSR_ASSERT_CS1N_BITS | QMI_DIRECT_CSR_EN_BITS);
+            return 0;  /* TX stuck — bail out, will retry */
         }
 
         qmi_wait_busy(100000);
@@ -142,22 +210,36 @@ static size_t __no_inline_not_in_flash_func(psram_detect)(void) {
 }
 
 size_t __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
+    /* Drive CS# HIGH via SIO before handing to QMI.
+     * After debug-probe reset, GPIO19 may still be XIP_CS1 function
+     * with stale QMI config — switch to SIO output HIGH first to
+     * give PSRAM a clean CS# deassert.
+     * Note: set output value BEFORE direction to avoid a LOW glitch. */
+    gpio_set_function(cs_pin, GPIO_FUNC_SIO);  /* switch away from XIP */
+    gpio_put(cs_pin, 1);                       /* output latch = HIGH */
+    gpio_set_dir(cs_pin, GPIO_OUT);            /* now driving HIGH */
+    psram_delay_us(500);  /* 500us with CS# HIGH — PSRAM sees clean deassert */
+
     gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
 
-    uint32_t intr_stash = save_and_disable_interrupts();
-
-    /* Retry detection up to 3 times (covers slow power-on and warm-boot glitches) */
+    /* Retry detection up to 5 times with 10ms delays between attempts.
+     * Each attempt gets its own interrupt-disabled window for QMI access;
+     * delays run with interrupts enabled for real-time accuracy. */
     size_t psram_size = 0;
-    for (int attempt = 0; attempt < 3 && !psram_size; attempt++) {
-        if (attempt > 0)
-            psram_delay_us(1000);  /* 1ms between retries */
+    for (int attempt = 0; attempt < 5 && !psram_size; attempt++) {
+        if (attempt > 0) {
+            printf("[PSRAM] attempt %d failed, retrying...\n", attempt);
+            psram_delay_us(10000);  /* 10ms between retries */
+        }
+        uint32_t intr_stash = save_and_disable_interrupts();
         psram_size = psram_detect();
+        restore_interrupts(intr_stash);
     }
 
-    if (!psram_size) {
-        restore_interrupts(intr_stash);
+    if (!psram_size)
         return 0;
-    }
+
+    uint32_t intr_stash = save_and_disable_interrupts();
 
     /* Enable direct mode, PSRAM CS, clkdiv of 10 */
     qmi_hw->direct_csr = 10 << QMI_DIRECT_CSR_CLKDIV_LSB |

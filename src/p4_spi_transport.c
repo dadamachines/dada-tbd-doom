@@ -122,10 +122,10 @@ extern uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size);
 #define TIMER_INTR          0x3c
 #define TIMER_INTE          0x40
 
-// Alarm period: check RDY ~4x per codec period for reliable catch.
-// P4 codec runs at 44100/32 = 1378 Hz (725 µs). Using 725 µs causes ~50%
-// phase-miss rate. At 200 µs (5000 Hz) we catch RDY within 1 tick.
-// ISR cost: ~12 µs per fire × 5000 = 6% CPU.
+// Alarm period: poll PWM counter + RDY at 5000 Hz.
+// Codec frame rate = 44100/32 = 1378 Hz (725 µs). At 200 µs we detect
+// each new codec frame within one ISR tick and respond immediately.
+// ISR cost: ~12 µs per fire × 5000 = 6% CPU (most ticks exit early).
 #define ALARM_PERIOD_US     200
 
 // TIMER1 reset bit (bit 24 in RESETS register)
@@ -145,6 +145,23 @@ extern uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size);
 #define TICKS_TIMER1_CTRL       0x24
 #define TICKS_TIMER1_CYCLES     0x28
 
+// ── PWM registers (hardware edge counter for word-clock sync) ─────────
+// GPIO 27 carries the P4 codec I2S WS signal at 44100 Hz.
+// PWM slice 1 counts falling edges in hardware — no CPU overhead.
+// Every 32 edges = one codec DMA frame (44100/32 = 1378.125 Hz).
+#define PWM_BASE            0x400A8000
+#define PWM_CH_STRIDE       0x14    // 5 registers × 4 bytes per slice
+#define PWM_CHn_CSR(n)      ((n) * PWM_CH_STRIDE + 0x00)
+#define PWM_CHn_DIV(n)      ((n) * PWM_CH_STRIDE + 0x04)
+#define PWM_CHn_CTR(n)      ((n) * PWM_CH_STRIDE + 0x08)
+#define PWM_CHn_TOP(n)      ((n) * PWM_CH_STRIDE + 0x10)
+// GPIO 27 → PWM slice (27>>1)&7 = 5, channel B  (RP2350B: GPIO<32 uses &7)
+#define WS_PWM_SLICE        5
+#define WS_PIN              27      // Codec word-clock input
+#define WS_EDGES_PER_FRAME  32      // 32 WS cycles = 1 codec DMA buffer
+#define FUNC_PWM            4       // GPIO function mux for PWM
+#define RESETS_PWM_BIT      (1u << 16)
+
 // ── SPI buffers ────────────────────────────────────────────────────────
 static uint8_t tx_buf[SPI_BUF_LEN];
 static uint8_t rx_buf[SPI_BUF_LEN];
@@ -163,7 +180,14 @@ static volatile uint32_t dbg_frames_sent  = 0;
 static volatile uint32_t dbg_isr_fires    = 0;   // total ISR invocations
 static volatile uint32_t dbg_isr_dma_busy = 0;   // skipped: DMA still running
 static volatile uint32_t dbg_isr_rdy_low  = 0;   // skipped: P4 not ready
+static volatile uint32_t dbg_ws_skipped   = 0;   // word-clock frames we couldn't send
 static uint32_t dbg_polls        = 0;
+
+// ── Word-clock frame tracking (PWM hardware edge counter) ──────────────
+static uint16_t ws_last_ctr    = 0;    // last PWM counter reading
+static uint16_t ws_edge_accum  = 0;    // accumulated edges since last frame
+static volatile uint32_t ws_frame_count  = 0;  // codec frames elapsed (from WS)
+static volatile uint32_t sent_frame_count = 0; // SPI frames we've actually sent
 
 // ── Protocol sequence counter (100-199, wrapping) ──────────────────────
 static uint8_t seq_counter = 100;
@@ -266,9 +290,10 @@ static void pack_frame(void) {
     hdr->payload_crc = crc;
 }
 
-// ── Timer1 Alarm0 ISR — fires at ~1378 Hz to pace SPI frames ──────────
-// Runs on core0 (same as game loop). Ring buffer is safe: ISR only reads
-// ring_read, game loop only writes ring_write (SPSC, volatile indices).
+// ── Timer1 Alarm0 ISR — word-clock-paced SPI frame sender ──────────────
+// Fires at 5000 Hz to poll the PWM edge counter on GPIO 27 (codec WS).
+// Only sends one SPI frame per 32 WS edges (= one codec DMA cycle).
+// This locks RP2350 output exactly to the P4 codec sample rate.
 static void timer1_alarm0_isr(void) {
     // Clear the alarm interrupt (write 1 to bit 0)
     REG32(TIMER1_BASE, TIMER_INTR) = 1u;
@@ -279,7 +304,23 @@ static void timer1_alarm0_isr(void) {
 
     dbg_isr_fires++;
 
-    // If previous DMA still running, skip this tick
+    // ── Read hardware edge counter (PWM slice 1 counts WS falling edges) ──
+    uint16_t ctr = (uint16_t)REG32(PWM_BASE, PWM_CHn_CTR(WS_PWM_SLICE));
+    uint16_t delta = ctr - ws_last_ctr;   // uint16 subtraction handles wrap
+    ws_last_ctr = ctr;
+
+    // Accumulate edges, convert to codec frames
+    ws_edge_accum += delta;
+    while (ws_edge_accum >= WS_EDGES_PER_FRAME) {
+        ws_edge_accum -= WS_EDGES_PER_FRAME;
+        ws_frame_count++;
+    }
+
+    // ── Only send if a new codec frame has occurred ────────────────────
+    if (ws_frame_count <= sent_frame_count)
+        return;
+
+    // If previous DMA still running, skip this tick (will retry next tick)
     if (dma_is_busy(DMA_TX_CHAN) || dma_is_busy(DMA_RX_CHAN)) {
         dbg_isr_dma_busy++;
         return;
@@ -291,10 +332,47 @@ static void timer1_alarm0_isr(void) {
         return;
     }
 
-    // Pack and send (non-blocking — DMA completes in background)
+    // Pack and send one frame (non-blocking — DMA completes in background)
     pack_frame();
     start_dma(tx_buf, rx_buf, SPI_BUF_LEN);
+
+    // Snap to current frame count (don't burst-send if we fell behind)
+    if (ws_frame_count > sent_frame_count + 1) {
+        dbg_ws_skipped += (ws_frame_count - sent_frame_count - 1);
+    }
+    sent_frame_count = ws_frame_count;
     dbg_frames_sent++;
+}
+
+// ── Word-clock hardware counter init ───────────────────────────────────
+// Configures PWM slice 1 to count falling edges on GPIO 27 (WS pin).
+// This gives us a free-running hardware counter of codec WS cycles.
+// The ISR reads this counter to determine when to send SPI frames.
+static void ws_counter_init(void) {
+    // Bring PWM out of reset
+    REG32(RESETS_BASE + RESETS_ATOMIC_CLR, RESETS_RESET) = RESETS_PWM_BIT;
+    while (!(REG32(RESETS_BASE, RESETS_RESET_DONE) & RESETS_PWM_BIT)) {}
+
+    // Configure GPIO 27 for PWM function (edge counting on channel B)
+    // Pad: IE=1 (bit 6), SCHMITT=1 (bit 1) for clean edges
+    REG32(PADS_BANK0_BASE, PADS_GPIO_OFFSET(WS_PIN)) = (1u << 6) | (1u << 1);
+    REG32(IO_BANK0_BASE, IO_GPIO_CTRL_OFFSET(WS_PIN)) = FUNC_PWM;
+
+    // Configure PWM slice 1 for falling-edge counting on B pin
+    REG32(PWM_BASE, PWM_CHn_CSR(WS_PWM_SLICE)) = 0;            // Disable first
+    REG32(PWM_BASE, PWM_CHn_DIV(WS_PWM_SLICE)) = 1u << 4;      // DIV=1 (INT=1, FRAC=0)
+    REG32(PWM_BASE, PWM_CHn_CTR(WS_PWM_SLICE)) = 0;            // Reset counter
+    REG32(PWM_BASE, PWM_CHn_TOP(WS_PWM_SLICE)) = 0xFFFF;       // Free-running 16-bit
+    // CSR: DIVMODE=0b11 (falling edge on B pin), EN=1
+    REG32(PWM_BASE, PWM_CHn_CSR(WS_PWM_SLICE)) = (3u << 4) | 1u;
+
+    ws_last_ctr = 0;
+    ws_edge_accum = 0;
+    ws_frame_count = 0;
+    sent_frame_count = 0;
+
+    printf("[P4-SPI] Word-clock counter: PWM slice %d on GPIO %d, %d edges/frame\n",
+           WS_PWM_SLICE, WS_PIN, WS_EDGES_PER_FRAME);
 }
 
 void p4_spi_transport_init(void) {
@@ -340,6 +418,9 @@ void p4_spi_transport_init(void) {
     // ── Handshake input (active high from P4 = transaction queued) ─────
     // Matches DaDa_SPI: gpio_init(handshake), gpio_set_dir(IN), gpio_pull_down()
     gpio_set_input_pulldown(P4_RDY_PIN);  // 22 = P4 RDY
+
+    // ── Initialize word-clock edge counter on GPIO 27 ──────────────────
+    ws_counter_init();
 
     // ── Build DMA CTRL values ──────────────────────────────────────────
     // These match DaDa_SPI's channel_config_set_* calls exactly:
@@ -408,11 +489,12 @@ void p4_spi_transport_poll(void) {
     // This function just prints periodic debug stats.
     if (++dbg_polls >= 70) {
         dbg_polls = 0;
-        printf("[P4-SPI] sent=%lu isr=%lu dma_busy=%lu rdy_low=%lu rdy=%d\n",
+        printf("[P4-SPI] sent=%lu isr=%lu dma_busy=%lu rdy_low=%lu ws_skip=%lu rdy=%d\n",
                (unsigned long)dbg_frames_sent,
                (unsigned long)dbg_isr_fires,
                (unsigned long)dbg_isr_dma_busy,
                (unsigned long)dbg_isr_rdy_low,
+               (unsigned long)dbg_ws_skipped,
                gpio_read_pin(P4_RDY_PIN));
     }
 }

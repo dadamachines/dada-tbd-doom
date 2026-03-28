@@ -5,10 +5,10 @@
 The TBD-16 runs Doom on the RP2350B co-processor, but audio output is handled by
 the ESP32-P4 main processor through its TLV320AIC3254 codec (I2S, 44100 Hz,
 32-bit stereo, 32-sample blocks). The RP2350 generates Doom's OPL music and SFX
-at 49716 Hz and streams raw PCM2 frames (up to 62 stereo pairs per SPI frame)
-over SPI1 DMA to the P4 at ~1400 frames/sec. The P4's PicoAudioBridge plugin
-resamples from 49716→44100 Hz using a cubic Hermite (Catmull-Rom) 4-tap
-resampler with adaptive rate matching.
+at 49716 Hz and streams raw PCM2 frames (32 or 36 stereo pairs per SPI frame,
+rate-matched to source) over SPI1 DMA to the P4, paced by the codec word clock
+on GPIO 27. The P4's PicoAudioBridge plugin resamples from 49716→44100 Hz using
+a cubic Hermite (Catmull-Rom) 4-tap resampler with adaptive rate matching.
 
 This document covers the full system architecture and current status.
 
@@ -33,17 +33,19 @@ This document covers the full system architecture and current status.
 │  (raw 49716 Hz to P4)       │        │     │     (blocks ~725µs)│   │
 │         │                   │        │     └────────────────────┘   │
 │  TIMER1 Alarm ISR (5000 Hz) │        │                              │
-│    pab_pack_spi() ─────┐    │        │  SPI2 Slave (triple-buffered)│
-│    pack_frame()        │    │  SPI1  │    QueueBuffer → handshake   │
-│    start_dma() ────────┼────┼──DMA──►│    GetReceivedBuffer         │
+│  ┌─ PWM edge counter ─────┐ │        │  SPI2 Slave (triple-buffered)│
+│  │ GPIO 27 ← WS (44100Hz) │◄├────────│    QueueBuffer → handshake   │
+│  │ 32 edges = 1 frame     │ │        │    GetReceivedBuffer         │
+│  └─────────────────────────┘ │        │         │                    │
+│    pab_pack_spi() ─────┐    │        │         ▼                    │
+│    pack_frame()        │    │  SPI1  │  PicoAudioBridge::Process()  │
+│    start_dma() ────────┼────┼──DMA──►│    AA LPF → resample → ×8    │
 │         │              │    │ 25MHz  │         │                    │
 │    (non-blocking)      │    │ 512B   │         ▼                    │
-│                        │    │        │  PicoAudioBridge::Process()  │
-│  Game loop (~35 fps)   │    │        │    AA LPF → resample → ×8    │
-│    I_Pico_UpdateSound()│    │        │         │                    │
-│      fills ring buffer │    │        │         ▼                    │
 │                        │    │        │  TLV320AIC3254 Codec (I2S)   │
-│                        │    │        │    44100 Hz, 32-bit stereo   │
+│  Game loop (~35 fps)   │    │        │    44100 Hz, 32-bit stereo   │
+│    I_Pico_UpdateSound()│    │        │    WS (GPIO 27) ────────────►│
+│      fills ring buffer │    │        │                              │
 └─────────────────────────────┘        └──────────────────────────────┘
          │
          │ Control SPI (spi0, 2048B)
@@ -61,6 +63,7 @@ This document covers the full system architecture and current status.
 | SCLK      | 30          | 30      | RP → P4   |
 | MOSI (TX) | 31          | 31      | RP → P4   |
 | Handshake | 22 (input)  | 51 (output) | P4 → RP |
+| Word Clock| 27 (input)  | I2S WS      | P4 → RP |
 
 - **SPI Mode 3** (CPOL=1, CPHA=1), 25 MHz clock, 8-bit transfers
 - **512-byte DMA frames** (STREAM_BUFFER_SIZE_ on both sides)
@@ -102,23 +105,27 @@ buffer as fast as possible:
 - Pushes ~1400 stereo samples per frame into ring buffer via `pab_give_buffer()`
 - Calls `p4_spi_transport_poll()` (now only prints debug stats)
 
-### 2. Timer ISR — SPI Transport (p4_spi_transport.c)
+### 2. Timer ISR — Word-Clock-Paced SPI Transport (p4_spi_transport.c)
 
-A TIMER1 alarm ISR fires at **5000 Hz** (200 µs period) and handles all SPI
-frame transmission independent of the game loop:
+A TIMER1 alarm ISR fires at **5000 Hz** (200 µs period) to poll the codec word
+clock and send SPI frames locked to the P4's actual sample rate:
 
 1. Clears alarm interrupt, re-arms at `now + 200 µs`
-2. Checks if previous DMA is still busy → skip if yes
-3. Checks P4 handshake GPIO 22 (HIGH = ready) → skip if LOW
-4. `pack_frame()` → `pab_pack_spi()` reads up to 62 raw stereo int16 samples
-   from the ring buffer (no resampling), packs into a PCM2 frame in
-   `p4_spi_request2.synth_midi[]`. Returns 0 if ring buffer is empty (skips
-   frame entirely to avoid injecting silence into P4 ring buffer).
-5. `start_dma()` → configures TX+RX DMA channels, triggers both simultaneously
-6. Returns immediately (DMA completes in background, ~164 µs)
+2. Reads PWM hardware edge counter (GPIO 27, falling edges of I2S WS at 44100 Hz)
+3. Accumulates edges; every 32 edges = one codec DMA frame boundary
+4. **Only sends if a new codec frame has occurred** (ws_frame_count > sent_frame_count)
+5. Checks if previous DMA is still busy → skip if yes (retries next tick)
+6. Checks P4 handshake GPIO 22 (HIGH = ready) → skip if LOW
+7. `pack_frame()` → `pab_pack_spi()` reads up to 32 (at 44100 Hz) or 36 (at
+   49716 Hz) raw stereo int16 samples from the ring buffer (no resampling),
+   packs into a PCM2 frame. Returns 0 if ring buffer is empty (skips frame).
+8. `start_dma()` → triggers DMA, returns immediately (~164 µs in background)
+9. Snaps `sent_frame_count` to current `ws_frame_count` — if multiple frames
+   have elapsed (e.g., RDY was low for a while), only sends one frame and
+   skips the rest, avoiding burst-sending that would overflow the P4 ring buffer
 
-The ISR is **non-blocking** — it never waits. DMA finishes in the background
-and the next ISR invocation checks completion before sending again.
+The ISR is **non-blocking** — it never waits. The PWM hardware counts word-clock
+edges with zero CPU overhead, and the ISR just reads a register.
 
 ### 3. P4 Audio Task — Receive & Codec Output (SPManager.cpp)
 
@@ -176,14 +183,15 @@ Simple additive checksum with seed 42, computed over the `p4_spi_request2` paylo
 ```
 Offset  Size  Field
 0       4     PCM2 magic: 0x50434D32 ("PCM2")
-4       2     sample_count (uint16, 1-62 stereo pairs)
-6       2     source_rate_hz (uint16, e.g. 49716)
+4       2     sample_count (uint16, capped to rate×32/44100 per frame)
+6       2     source_rate_hz (uint16, e.g. 49716 or 44100)
 8       N×4   N interleaved stereo int16 samples (L0 R0 L1 R1 ...)
               N = sample_count, max 62 × 4 = 248 bytes
 ```
 
 Max payload: 8 + 248 = 256 bytes (fills entire `synth_midi[]`).
-At full rate with 62 stereo pairs per frame at ~800 Hz effective: ~200 KB/s.
+Typical: 32 samples/frame at 44100 Hz, 36 samples/frame at 49716 Hz.
+Frame rate locked to codec word clock: 44100/32 = 1378.125 Hz.
 
 **Legacy PCM! protocol** (backward compat, no longer sent):
 
@@ -226,8 +234,10 @@ Doom with `USE_EMU8950_OPL=1` generates audio at **49716 Hz** (native OPL clock
 
 The RP2350 sends raw 49716 Hz samples via PCM2 frames. No resampling on the
 RP2350 side. The ring buffer stores 49716 Hz stereo pairs (2048 pairs, power
-of 2 for fast masking, SPSC lock-free). `pab_pack_spi()` simply copies up to
-62 stereo pairs per frame from the ring buffer.
+of 2 for fast masking, SPSC lock-free). `pab_pack_spi()` copies a capped
+number of stereo pairs per frame: `target_per_frame = rate × 32 / 44100`
+(32 at 44100 Hz, 36 at 49716 Hz). This matches the P4 codec's consumption
+rate per I2S DMA cycle.
 
 When the ring buffer is empty, `pab_pack_spi()` returns 0 (no frame sent),
 avoiding the injection of zero-value samples that would disrupt the P4's
@@ -288,14 +298,21 @@ whether issues are in the SPI/P4 chain or in the audio pipeline.
 
 ## RP2350 Timer ISR Transport
 
-### Why a Timer ISR (not poll-based)
+### Why a Timer ISR with Word-Clock Sync
 
 The original implementation polled for P4 readiness and sent frames during
 `p4_spi_transport_poll()` called from the game loop at ~35 fps. This couldn't
 deliver the 1378 frames/sec needed by the P4 codec (44100 Hz ÷ 32 samples).
 
-The current implementation uses **TIMER1 ALARM0** to fire an ISR at 5000 Hz,
-completely decoupled from the game loop timing.
+A free-running ISR at 5000 Hz was tried next, but it over-delivered frames:
+the ISR would catch P4 RDY HIGH multiple times per codec cycle, sending
+more frames than the P4 consumed, overflowing the P4's ring buffer and
+causing timing compression (45s of audio playing in ~33.5s).
+
+The current implementation uses **TIMER1 ALARM0** at 5000 Hz combined with a
+**PWM hardware edge counter** on GPIO 27 (codec word clock at 44100 Hz).
+The ISR only sends one SPI frame per 32 WS edges (one codec DMA cycle),
+locking the RP2350 output rate exactly to the P4 codec clock.
 
 ### TIMER1 Register Map
 
@@ -311,6 +328,28 @@ completely decoupled from the game loop timing.
 - **Reset bit**: bit 24 in RESETS register
 - **IRQ**: TIMER1_IRQ_0 = IRQ 4 on RP2350
 - **NVIC**: ISER at `0xE000E100`, ICPR at `0xE000E280`
+
+### Word-Clock Counter — PWM Hardware
+
+GPIO 27 carries the P4 codec's I2S WS signal (44100 Hz square wave). PWM slice 5
+is configured in **falling-edge counting mode** on channel B (GPIO 27), counting
+WS transitions in hardware with zero CPU overhead.
+
+| Register | Address | Value | Purpose |
+|----------|---------|-------|---------|
+| CH5_CSR  | PWM+0x64 | 0x31 | DIVMODE=0b11 (falling edge B), EN=1 |
+| CH5_DIV  | PWM+0x68 | 0x10 | INT=1, FRAC=0 (count every edge) |
+| CH5_CTR  | PWM+0x6C | read | 16-bit free-running edge count |
+| CH5_TOP  | PWM+0x74 | 0xFFFF | Wrap at 65535 |
+
+- **PWM base**: `0x400A8000`
+- **Reset bit**: bit 16 in RESETS register
+- **Slice mapping**: GPIO 27 → slice `(27>>1)&7` = 5, channel B
+  (RP2350B uses `(gpio>>1)&7` for GPIO 0-31, `8+((gpio>>1)&3)` for GPIO 32-47)
+- **Counter wrap**: Every ~1.486 sec (65536/44100). ISR reads delta every 200 µs
+  (delta ≈ 8-9 edges per tick), so no risk of missed wraps.
+- **Frame detection**: ISR accumulates edge deltas; every 32 edges =
+  one codec DMA frame (44100/32 = 1378.125 Hz)
 
 ### Tick Generator — Critical Detail
 
@@ -342,20 +381,27 @@ timer1_alarm0_isr() fires every 200 µs:
   ├── Clear INTR bit 0
   ├── Re-arm: ALARM0 = now + 200
   ├── dbg_isr_fires++
+  ├── Read PWM counter (WS edge count)
+  ├── delta = ctr - last_ctr (handles 16-bit wrap)
+  ├── Accumulate edges → ws_frame_count (every 32 edges)
+  ├── ws_frame_count <= sent? → return (no new codec frame)
   ├── DMA busy? → dbg_isr_dma_busy++, return
   ├── RDY LOW?  → dbg_isr_rdy_low++, return
-  └── pack_frame() + start_dma() → dbg_frames_sent++
+  └── pack_frame() + start_dma()
+      ├── Snap sent_frame_count = ws_frame_count
+      └── dbg_frames_sent++
 ```
 
 ### Performance (measured)
 
-| Metric | Value | Target |
-|--------|-------|--------|
-| ISR fire rate | 4755 Hz | 5000 Hz |
-| DMA busy skips | 13.6% | Expected (164µs DMA / 200µs period) |
-| **RDY LOW skips** | **72.1%** | **Should be <30%** |
-| Frame delivery rate | **678 Hz** | **1378 Hz needed** |
-| ISR overhead | ~6% CPU | Acceptable |
+| Metric | Value | Notes |
+|--------|-------|-------|
+| ISR fire rate | ~5000 Hz | Polls PWM counter + RDY |
+| Word-clock sync | PWM slice 5 on GPIO 27 | Hardware edge counter, zero CPU |
+| Frame delivery rate | 1378 Hz | Locked to codec word clock |
+| Samples/frame (44100 Hz) | 32 | `rate × 32 / 44100` |
+| Samples/frame (49716 Hz) | 36 | `rate × 32 / 44100` |
+| ISR overhead | ~6% CPU | Most ticks exit early (no new codec frame) |
 
 ### Why No SDK Headers
 
@@ -372,9 +418,11 @@ no `hardware/dma.h`, no `hardware/spi.h`.
 |-----------|--------|-------|
 | PSRAM warm-boot | ✅ Working | Exit QPI + Reset + 200µs delay, 3 retries (cold boot needed after debug probe reset) |
 | RP2350 ring buffer (SPSC) | ✅ Working | 2048 stereo pairs, lock-free, volatile indices |
-| PCM2 raw transport | ✅ Working | Up to 62 stereo pairs per frame, no RP2350-side resampling |
+| PCM2 raw transport | ✅ Working | 32 (44100 Hz) or 36 (49716 Hz) stereo pairs per frame |
 | SPI1 DMA transport | ✅ Working | 25 MHz Mode 3, channels 4/5, 512-byte frames |
-| TIMER1 alarm ISR | ✅ Working | 5000 Hz, non-blocking, ~6% CPU |
+| Word-clock sync | ✅ Working | PWM edge counter on GPIO 27 (codec WS), 32 edges = 1 frame |
+| TIMER1 alarm ISR | ✅ Working | 5000 Hz polling, word-clock-gated, ~6% CPU |
+| Frame-rate cap | ✅ Working | `target_per_frame = rate × 32 / 44100` prevents per-frame ring overflow |
 | P4 pipeline reorder | ✅ Working | WriteBuffer before GetReceivedBuffer, ~1400 Hz throughput |
 | P4 cubic Hermite resampler | ✅ Working | 49716→44100 Hz, 4-tap Catmull-Rom |
 | P4 anti-aliasing filter | ✅ Working | 2nd-order Butterworth biquad LPF at 20 kHz |
@@ -384,7 +432,7 @@ no `hardware/dma.h`, no `hardware/spi.h`.
 | Int16 mixer | ✅ Working | Same as original: `<<= 3` in OPL + additive SFX, wraps |
 | Multicore atomic lock | ✅ Working | LDREX/STREX try-lock, non-blocking, both cores safe |
 | SFX pitch correction | ✅ Working | Divides by NORM_PITCH (127), not by pitch (was no-op) |
-| Test tone generator | ✅ Working | 440 Hz sine, bypasses ring buffer |
+| Test tone generator | ✅ Working | 11-phase test tones (see i_picosound.c), bypasses ring buffer |
 | P4 SPI slave receive | ✅ Working | Triple-buffered, handshake, CRC validation |
 | Control link (SPI0) | ✅ Working | SetActivePlugin at boot |
 | Skip empty frames | ✅ Working | `pab_pack_spi` returns 0 when ring empty |
@@ -396,7 +444,13 @@ TLV320 codec).
 
 ---
 
-## P4-Side Bottleneck — Detailed Analysis
+## P4-Side Bottleneck — Historical Analysis
+
+> **Note**: This section documents the bottleneck that existed with the
+> free-running ISR approach. The word-clock sync (PWM edge counter on GPIO 27)
+> resolves the timing issues by locking frame delivery to the codec's actual
+> sample rate. The RDY-low skip rate doesn't matter anymore because the ISR
+> only attempts to send when a new codec frame boundary has occurred.
 
 ### The Problem
 
@@ -449,6 +503,44 @@ Debug output from RP2350 (5-second capture):
 - DMA busy: 3230 / 23775 = **13.6%** (expected: 164µs DMA / 200µs ≈ 82% overlap)
 - **RDY LOW: 17155 / 23775 = 72.1%** ← P4 not ready most of the time
 - Actually sent: 3390 / 5s = **678 Hz** ← half of what's needed
+
+---
+
+## Audio Bug History
+
+### Bug 1: Per-Frame Ring Overflow (Fixed)
+
+**Symptom**: 1000 Hz test tone recorded as ~559 Hz. All frequencies wrong.
+
+**Root cause**: `pab_pack_spi()` packed up to 62 stereo pairs per SPI frame,
+but the P4 codec only consumes 32 per I2S DMA cycle. The P4's `ring_push()`
+drops oldest samples on overflow (`ring_rd += drop`), causing systematic
+skipping that changes the observed frequency.
+
+**Simulation evidence**: `tools/sim_overflow.py` reproduces exactly —
+62 in / 32 out → 558.6 Hz dominant, matching recording.
+
+**Fix**: Cap samples per frame to `rate × 32 / 44100` (= 32 at 44100 Hz,
+= 36 at 49716 Hz). Each SPI frame now contains exactly what the P4 consumes
+per codec cycle.
+
+### Bug 2: Timing Compression (Fixed)
+
+**Symptom**: After Bug 1 fix, frequencies correct but timing compressed —
+45 seconds of test content plays in ~33.5 seconds (0.74×).
+
+**Root cause**: The free-running 5000 Hz ISR caught P4 RDY HIGH multiple
+times per codec cycle, sending multiple SPI frames per cycle. Even though
+each frame had the right number of samples (32), sending too many frames per
+second still overflowed the P4 ring buffer. Effective playback rate was
+~53972 Hz instead of 44100 Hz.
+
+**Fix**: Word-clock synchronization. PWM slice 5 counts falling edges on
+GPIO 27 (codec WS at 44100 Hz) in hardware. The ISR only sends one frame per
+32 WS edges (one codec DMA cycle), locking the RP2350 output exactly to the
+P4's codec clock. If the ISR falls behind (RDY was low for multiple frames),
+it snaps to the current frame count and sends only one frame — no burst
+catching up.
 
 ---
 
