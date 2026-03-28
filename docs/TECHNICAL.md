@@ -85,8 +85,8 @@ Before each frame write, the GRAM pointer must be reset:
 
 ### SPI Speed
 
-- **8 MHz:** Known stable, ~1ms per 1024-byte frame write
-- **20-30 MHz:** The SSD1309 datasheet allows higher speeds, but failed on TBD-16 hardware (blank screen). Likely PCB trace/capacitance issue. Stick with 8 MHz.
+- **10 MHz:** Current setting, matches SSD1309 datasheet maximum (t_cycle ≥ 100 ns). Stable.
+- **20-30 MHz:** Tested but failed on TBD-16 hardware (blank screen). Likely PCB trace/capacitance issue.
 
 ---
 
@@ -349,28 +349,11 @@ pio device monitor -e doom-tbd16
 - `DOOM_TINY` is designed for ~40KB — 170KB is plenty
 - Display frame buffers: 4 × 1024 bytes = 4KB static allocation on core 1's stack
 
-### Flash (16 MB W25Q080, XIP-mapped)
+### Flash (XIP-mapped)
 
-The RP2350 memory-maps the entire 16 MB SPI flash via XIP (Execute In Place) starting at `XIP_BASE = 0x10000000`. All flash reads are transparent pointer dereferences — no explicit SPI transactions needed at runtime.
+The RP2350 memory-maps SPI flash via XIP (Execute In Place) starting at `XIP_BASE = 0x10000000`. The firmware occupies ~250 KB starting at `0x10000000`.
 
-#### Flash Memory Map
-
-```
-0x10000000  XIP_BASE ─── Bootloader + Firmware (~250 KB)
-0x10040000  ──────────── doom1.whx (compressed WAD) ← TINY_WAD_ADDR
-                         (variable size, ~500 KB for shareware)
-0x11000000  ──────────── End of 16 MB flash
-```
-
-#### WAD Address
-
-The WAD is placed at a fixed flash address defined in `platformio.ini`:
-
-```
-TINY_WAD_ADDR = 0x10040000
-```
-
-This is 256 KB (0x40000) past `XIP_BASE`, leaving room for the firmware binary. The address is used by both the build system (to place the data) and the runtime (to read it).
+> **Note:** The WAD file is NOT stored in flash. It is loaded from the SD card into PSRAM at boot. See the PSRAM section below.
 
 #### WAD Format (WHX)
 
@@ -762,8 +745,6 @@ The following ideas have NOT been tested and may be worth investigating:
 
 ## 10. Known Issues & Future Work
 
-- **UF2 drag-and-drop:** Does not work — `cp firmware.uf2 /Volumes/RP2350/` fails with exit code 1. Seven different approaches tested (partition tables, family IDs, absolute addressing). Use `picotool load --ignore-partitions` or debug probe instead. See **Section 9** for full research.
-- **Audio:** Not implemented. Sound stubs exist (`i_picosound_stub.c`) but no I2S output to the audio codec.
-- **SPI speed:** 8 MHz works, 20-30 MHz causes blank screen on current hardware. May be fixable with better SPI signal integrity or slower ramp rates.
-- **UART debug:** UART1 TX on GPIO20 is wired to the debug probe but currently produces no output despite correct initialization. Suspected physical wire disconnection on the 4th SWD cable. The 3 SWD wires (SWDIO, SWCLK, GND) work for CMSIS-DAP flashing.
-- **WAD loading:** Currently uses the embedded shareware `doom1.whx`. SD card loading would allow full Doom and custom WADs.
+- **UF2 drag-and-drop (WAD-in-UF2):** The historical approach of embedding WAD in the UF2 and drag-dropping never worked. See **Section 9** for research. Current approach (SD card) bypasses this entirely. Firmware-only UF2 drag-and-drop works.
+- **SPI speed:** 10 MHz works (SSD1309 datasheet max). 20-30 MHz causes blank screen on current hardware — likely PCB trace characteristics.
+- **UART debug:** UART1 TX on GPIO20 is wired to the debug probe but currently produces no output. Suspected physical wire disconnection on the 4th SWD cable.

@@ -38,7 +38,7 @@ From datasheet Section 3.3.3:
 | CS setup time (t_CSS) | 20 | — | ns |
 | CS hold time (t_CSH) | 50 | — | ns |
 
-**Maximum SPI clock = 1 / 100 ns = 10 MHz.** Our 8 MHz is within spec with margin.
+**Maximum SPI clock = 1 / 100 ns = 10 MHz.** We run at the datasheet maximum.
 
 ### Initialization Differences: Datasheet vs Our Code
 
@@ -94,7 +94,7 @@ Since the switch to PIO SPI, the display transfer path is fundamentally differen
 | Parameter | Value |
 |-----------|-------|
 | PIO | pio0, SM 0 |
-| Clock | 8 MHz (150 MHz sys / 2 cycles per bit / clkdiv 9.375) |
+| Clock | 10 MHz (150 MHz sys / 2 cycles per bit / clkdiv 7.5) |
 | Protocol | SPI Mode 0 (CPOL=0, CPHA=0) |
 | Shift | MSB first, autopull 8-bit |
 | SCK | GPIO 14 (side-set) |
@@ -104,14 +104,14 @@ Since the switch to PIO SPI, the display transfer path is fundamentally differen
 ### Transfer Timing
 
 ```
-1 byte  = 8 bits × 2 PIO cycles × (1/8 MHz) = 2 µs per byte
-6 bytes (command_park)                       = 12 µs
-1024 bytes (frame data)                      = 2048 µs ≈ 2.0 ms
-DC toggle + CS assertions                    ≈ 0.01 ms
-                                    Total    ≈ 2.06 ms per frame write
+1 byte  = 8 bits × 2 PIO cycles × (1/10 MHz) = 1.6 µs per byte
+6 bytes (command_park)                        = 9.6 µs
+1024 bytes (frame data)                       = 1638 µs ≈ 1.6 ms
+DC toggle + CS assertions                     ≈ 0.01 ms
+                                     Total    ≈ 1.65 ms per frame write
 ```
 
-**Correction to previous estimate:** At 8 MHz actual PIO clock, the transfer is ~2.0 ms, not ~1.0 ms. This is because each byte takes 8 bits × (1/8 MHz) = 1 µs for clocking, but the PIO program uses 2 cycles per bit (data setup + clock rise), and the `pio_sm_put_blocking()` loop adds overhead per byte from the left-shift and FIFO stall checking.
+At 10 MHz PIO clock, each byte takes 8 bits × 2 PIO cycles × (1/10 MHz) = 1.6 µs. With DMA, FIFO stall overhead is eliminated.
 
 ### Why PIO SPI Matters for Temporal Dithering
 

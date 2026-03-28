@@ -17,7 +17,7 @@ Everything about how Doom's rendered frames get from the engine to pixels on the
  │ pixels into       │ double-buffered   │    remap_lut[256]                │
  │ frame_buffer[]    │                   │ 5. Dithering (15 methods)        │
  │                   │                   │ 6. Pack → SSD1309 page format    │
- │ Signals via       │                   │ 7. SPI write (PIO, 8 MHz)       │
+ │ Signals via       │                   │ 7. SPI write (PIO, 10 MHz)      │
  │ display_frame_idx │                   │ 8. Wait for next game frame      │
  └──────────────────┘                   └───────────────────────────────────┘
 ```
@@ -311,7 +311,7 @@ The OLED SPI uses a PIO (Programmable IO) state machine instead of the hardware 
 
 - **State machine:** pio0, SM 0
 - **Pins:** SCK = GPIO 14 (side-set), MOSI = GPIO 15 (OUT)
-- **Speed:** 8 MHz (`OLED_SPI_FREQ`). With 150 MHz sys_clk: clkdiv = 150/(8×2) = 9.375
+- **Speed:** 10 MHz (`OLED_SPI_FREQ`). With 150 MHz sys_clk: clkdiv = 150/(10×2) = 7.5
 - **Shift:** MSB first, autopull 8 bits
 - **Protocol:** CPOL=0, CPHA=0 — data setup on falling edge, sampled on rising edge
 
@@ -343,7 +343,7 @@ static const uint8_t command_park[] = {
 };
 ```
 
-**Timing:** 1024 bytes × 8 bits ÷ 8 MHz = ~1.0 ms per frame. Plus 6 bytes of command → ~1.01 ms total. Well under the 16.7 ms game frame budget.
+**Timing:** 1024 bytes × 8 bits ÷ 10 MHz = ~0.82 ms per frame. Plus 6 bytes of command → ~0.83 ms total. Well under the 16.7 ms game frame budget.
 
 ### Frame Refresh Strategy
 
@@ -371,7 +371,7 @@ This ensures the OLED always has the latest data in GRAM (the SSD1309 scans asyn
 | Controller | SSD1309 (Solomon Systech) |
 | Resolution | 128 × 64 pixels, monochrome |
 | Physical size | ~2.4" diagonal |
-| Interface | SPI (PIO), 8 MHz |
+| Interface | SPI (PIO), 10 MHz |
 | GRAM | 1024 bytes (128 × 8 pages) |
 | Addressing mode | Horizontal (0x20, 0x00) |
 | Refresh | Internal scan, no external VSYNC |
@@ -414,7 +414,7 @@ This ensures the OLED always has the latest data in GRAM (the SSD1309 scans asyn
 - **No VSYNC:** The SSD1309 scans its GRAM continuously at its internal rate. There is no way to synchronize writes. This is why the 3-pass greyscale mode (mode 3) flickers — contrast changes mid-scan produce visible tearing.
 - **Contrast for mode 3:** Three sub-frame contrast levels `{0xDF, 0x5F, 0x17}` are written via command bytes between sub-frames.
 - **Pixel visibility:** At 2.4" the individual pixels are clearly visible. This means dithering patterns (Bayer crosshatch, FS worms) are more apparent than on higher-DPI screens.
-- **Speed:** 8 MHz SPI is reliable. 20-30 MHz was tested but failed (blank screen), likely due to PCB trace characteristics.
+- **Speed:** 10 MHz SPI is reliable (SSD1309 datasheet max). 20-30 MHz was tested but failed (blank screen), likely due to PCB trace characteristics.
 
 ### Two Drivers
 
@@ -549,11 +549,11 @@ PLATFORMIO_BUILD_FLAGS="-DJTBD16_DITHER_MODE=9 -DJTBD16_BN_MODULATION=24" \
  │  └────────────────────────────────────────┘                       │
  │                     ▼                                             │
  │  ┌────────────────────────────────────────┐                       │
- │  │ SPI WRITE (PIO, 8 MHz)                │                       │
+ │  │ SPI WRITE (PIO, 10 MHz)               │                       │
  │  │  CS LOW → DC LOW → command_park (6B)  │                       │
  │  │  DC HIGH → frame data (1024B)         │                       │
  │  │  CS HIGH                               │                       │
- │  │  ~1.01 ms per frame                    │                       │
+ │  │  ~0.83 ms per frame                    │                       │
  │  └────────────────────────────────────────┘                       │
  │                     ▼                                             │
  │  SSD1309 OLED (128×64 monochrome, 2.4")                          │

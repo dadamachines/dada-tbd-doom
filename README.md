@@ -225,9 +225,6 @@ tools/                  # Build, flash, and analysis utilities
 | [MANUAL.md](docs/MANUAL.md) | User manual — controls, gameplay tips |
 | [BUTTON_MAPPING.md](docs/BUTTON_MAPPING.md) | I2C protocol and physical button layout |
 | [PINMAP.md](docs/PINMAP.md) | Full hardware pin map (RP2350, ESP32-P4, STM32) |
-| [SPI_TRANSPORT.md](docs/SPI_TRANSPORT.md) | SPI transport protocol analysis |
-| [SPI_INVENTORY.md](docs/SPI_INVENTORY.md) | Hardware SPI interface inventory |
-| [SPI_LIBRARY.md](docs/SPI_LIBRARY.md) | DaDa_SPI library analysis |
 
 ---
 
