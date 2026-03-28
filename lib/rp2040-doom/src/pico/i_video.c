@@ -419,19 +419,19 @@ static void __not_in_flash_func(free_buffer_callback)() {
 #define PARK_LINES 2
 
 #if JTBD16
-// SSD1309 128x64 init sequence (TBD-16 custom values)
+// SSD1309 128x64 init sequence (TBD-16 optimized for PIO SPI + datasheet UG-2864AxxPG01)
 static const uint8_t command_initialise[] = {
     0xFD, 0x12,     // command lock (unlock)
     0xAE,           // display off
-    0xD5, 0xF0,     // set display clock divide — max oscillator for fastest internal refresh
+    0xD5, 0xF0,     // set display clock divide — max oscillator for fastest internal refresh (~118 Hz)
     0xA8, DISPLAYHEIGHT-1, // set multiplex ratio (63)
     0xD3, 0x00,     // set display offset
     0x40,           // set display start line 0
     0x20, 0x00,     // set horizontal addressing mode
     0xA1,           // set segment remap (mirrored — compensates for 180° HW mounting)
-    0xC0,           // set COM scan direction (normal — software Y-flip compensates for 180° HW mounting)
+    0xC8,           // set COM scan direction (remapped — hardware Y-flip, eliminates per-pixel software flip)
     0xDA, 0x12,     // set COM pins config (alternate)
-    0x81, 0xCF,     // set contrast (fixed — temporal dithering handles grey levels)
+    0x81, 0xDF,     // set contrast (datasheet recommended max for UG-2864AxxPG01)
     0xD9, 0x82,     // set pre-charge period (TBD-16 tuned)
     0xDB, 0x34,     // set VCOMH deselect (TBD-16 tuned)
     0xA4,           // display follows RAM
@@ -1152,8 +1152,77 @@ static void core1() {
             {229, 156, 241, 170, 113,  56, 175, 234, 130, 154, 107, 193,   9, 246,  49,  87},
         };
 
-        // Helper macro: look up luminance through remap LUT
-        #define LUM_AT(fb, y, x) remap_lut[display_palette[(fb)[(y) * SCREENWIDTH + (x)]]]
+        // Combined LUT: maps palette index → gamma-corrected luminance in one lookup
+        // instead of two (display_palette[] then remap_lut[]). Rebuilt per frame.
+        static uint8_t combined_lut[256];
+
+        // DMA-compatible frame buffer: each uint32_t holds (byte << 24)
+        // for direct DMA to PIO TX FIFO (MSB-first autopull).
+        static uint32_t dma_buf[DISPLAYWIDTH * (DISPLAYHEIGHT / 8)];
+
+        // Helper: rebuild combined LUT from current palette + gamma remap.
+        // Only 256 iterations — trivial vs 8192 pixels, saves one lookup per pixel.
+        #define REBUILD_COMBINED_LUT() do { \
+            for (int _i = 0; _i < 256; _i++) \
+                combined_lut[_i] = remap_lut[display_palette[_i]]; \
+        } while (0)
+
+        // Helper: pack frame[] into dma_buf[] for DMA transfer
+        #define PACK_DMA_BUF(frame) do { \
+            for (int _i = 0; _i < DISPLAYWIDTH * (DISPLAYHEIGHT / 8); _i++) \
+                dma_buf[_i] = (uint32_t)(frame)[_i] << 24; \
+        } while (0)
+
+        // Helper: send frame via DMA (non-blocking SPI transfer)
+        #define DMA_SEND_FRAME() do { \
+            gpio_put(J_OLED_CS, 0); \
+            gpio_put(J_OLED_DC, 0); \
+            oled_spi_write_blocking(command_park, sizeof(command_park)); \
+            gpio_put(J_OLED_DC, 1); \
+            oled_spi_dma_start(dma_buf, DISPLAYWIDTH * (DISPLAYHEIGHT / 8)); \
+            oled_spi_dma_wait(); \
+            gpio_put(J_OLED_CS, 1); \
+        } while (0)
+
+        // Helper macro: single-lookup luminance via combined LUT
+        // (replaces old 2-lookup LUM_AT: remap_lut[display_palette[...]])
+        #define LUM_AT(fb, y, x) combined_lut[(fb)[(y) * SCREENWIDTH + (x)]]
+
+#if JTBD16_PREDITHER_SMOOTH
+        // Pre-dither 3×3 Gaussian low-pass filter to reduce moiré from
+        // texture aliasing at 128×64. Kernel: [1 2 1; 2 4 2; 1 2 1] / 16.
+        // Costs ~1 ms per frame at 150 MHz — well within the 16.7 ms budget.
+        static uint8_t raw_lum_buf[DISPLAYHEIGHT * DISPLAYWIDTH];
+        static uint8_t smooth_lum[DISPLAYHEIGHT * DISPLAYWIDTH];
+
+        #define BUILD_SMOOTH_LUM(fb) do { \
+            for (int _y = 0; _y < DISPLAYHEIGHT; _y++) \
+                for (int _x = 0; _x < DISPLAYWIDTH; _x++) \
+                    raw_lum_buf[_y * DISPLAYWIDTH + _x] = \
+                        combined_lut[(fb)[_y * SCREENWIDTH + _x]]; \
+            for (int _y = 0; _y < DISPLAYHEIGHT; _y++) { \
+                const int _y0 = (_y > 0) ? _y - 1 : 0; \
+                const int _y2 = (_y < DISPLAYHEIGHT - 1) ? _y + 1 : _y; \
+                const uint8_t *_r0 = &raw_lum_buf[_y0 * DISPLAYWIDTH]; \
+                const uint8_t *_r1 = &raw_lum_buf[_y  * DISPLAYWIDTH]; \
+                const uint8_t *_r2 = &raw_lum_buf[_y2 * DISPLAYWIDTH]; \
+                for (int _x = 0; _x < DISPLAYWIDTH; _x++) { \
+                    const int _x0 = (_x > 0) ? _x - 1 : 0; \
+                    const int _x2 = (_x < DISPLAYWIDTH - 1) ? _x + 1 : _x; \
+                    smooth_lum[_y * DISPLAYWIDTH + _x] = ( \
+                        _r0[_x0] + _r0[_x] * 2 + _r0[_x2] + \
+                        _r1[_x0] * 2 + _r1[_x] * 4 + _r1[_x2] * 2 + \
+                        _r2[_x0] + _r2[_x] * 2 + _r2[_x2] \
+                    ) >> 4; \
+                } \
+            } \
+        } while (0)
+
+        #undef LUM_AT
+        #define LUM_AT(fb, y, x) smooth_lum[(y) * DISPLAYWIDTH + (x)]
+#else
+        #define BUILD_SMOOTH_LUM(fb) ((void)0)
+#endif
 
 #if JTBD16_DITHER_MODE == DITHER_ATKINSON
         // =========================================================
@@ -1169,17 +1238,18 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_buf, 0, sizeof(err_buf));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
                     int er   = sy % 3;
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_buf[er][sx];
                         int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                         int qe  = (val - out) >> 3;
@@ -1204,15 +1274,11 @@ static void core1() {
                     memset(err_buf[er], 0, DISPLAYWIDTH * sizeof(int16_t));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1233,11 +1299,14 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
+
                 for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
                     for (int x = 0; x < DISPLAYWIDTH; x++) {
                         uint8_t col = 0;
                         for (int b = 0; b < 8; b++) {
-                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            int y = p * 8 + b;
                             uint lum = LUM_AT(fb, y, x);
                             col >>= 1;
                             if (lum > blue_noise[y & 15][x & 15]) col |= 0x80;
@@ -1246,15 +1315,11 @@ static void core1() {
                     }
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1278,11 +1343,14 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
+
                 for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
                     for (int x = 0; x < DISPLAYWIDTH; x++) {
                         uint8_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                         for (int b = 0; b < 8; b++) {
-                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            int y = p * 8 + b;
                             uint lum = LUM_AT(fb, y, x);
                             c0 >>= 1; c1 >>= 1; c2 >>= 1; c3 >>= 1;
                             if (lum > blue_noise[(y             ) & 15][(x             ) & 15]) c0 |= 0x80;
@@ -1302,12 +1370,8 @@ static void core1() {
 
                 do {
                     for (int f = 0; f < 4; f++) {
-                        gpio_put(J_OLED_CS, 0);
-                        gpio_put(J_OLED_DC, 0);
-                        oled_spi_write_blocking(command_park, sizeof(command_park));
-                        gpio_put(J_OLED_DC, 1);
-                        oled_spi_write_blocking(frames[f], sizeof(frames[0]));
-                        gpio_put(J_OLED_CS, 1);
+                        PACK_DMA_BUF(frames[f]);
+                        DMA_SEND_FRAME();
                     }
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
@@ -1328,6 +1392,8 @@ static void core1() {
             while (true) {
                 uint8_t last_fi = display_frame_index;
 
+                REBUILD_COMBINED_LUT();
+
                 for (uint pass = 0; pass < 3; pass++) {
                     uint8_t level = 0x04 >> pass;
                     uint d = dither;
@@ -1338,8 +1404,8 @@ static void core1() {
                             uint8_t byte = 0;
                             for (int b = 0; b < 8; ++b) {
                                 d ^= 1;
-                                int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
-                                uint lum = remap_lut[display_palette[frame_buffer[display_frame_index][y * SCREENWIDTH + x]]];
+                                int y = p * 8 + b;
+                                uint lum = combined_lut[frame_buffer[display_frame_index][y * SCREENWIDTH + x]];
                                 lum = (lum >> 5) + ((lum >> 4) & d);
                                 if (lum > 7) lum = 7;
                                 byte >>= 1;
@@ -1393,31 +1459,31 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
 
                 // Pre-fill first row
                 {
-                    int fb_y = (DISPLAYHEIGHT - 1) - 0;
                     for (int x = 0; x < DISPLAYWIDTH; x++)
-                        lum_prev[x] = LUM_AT(fb, fb_y, x);
+                        lum_prev[x] = LUM_AT(fb, 0, x);
                 }
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
 
                     for (int x = 0; x < DISPLAYWIDTH; x++)
-                        lum_curr[x] = LUM_AT(fb, fb_y, x);
+                        lum_curr[x] = LUM_AT(fb, sy, x);
 
-                    int fb_y_next = (sy + 1 < DISPLAYHEIGHT) ? (DISPLAYHEIGHT - 1) - (sy + 1) : fb_y;
+                    int next_y = (sy + 1 < DISPLAYHEIGHT) ? sy + 1 : sy;
 
                     for (int x = 0; x < DISPLAYWIDTH; x++) {
                         int c = lum_curr[x];
                         int left  = (x > 0) ? lum_curr[x - 1] : c;
                         int right = (x + 1 < DISPLAYWIDTH) ? lum_curr[x + 1] : c;
                         int up    = lum_prev[x];
-                        int down  = LUM_AT(fb, fb_y_next, x);
+                        int down  = LUM_AT(fb, next_y, x);
 
                         int mean = (c * 4 + left + right + up + down) >> 3;
                         int boosted = c + (((c - mean) * JTBD16_EDGE_STRENGTH) >> 7);
@@ -1432,15 +1498,11 @@ static void core1() {
                     memcpy(lum_prev, lum_curr, DISPLAYWIDTH);
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1462,11 +1524,12 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_buf, 0, sizeof(err_buf));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
 
@@ -1474,7 +1537,7 @@ static void core1() {
                         // --- Atkinson region (3D viewport) ---
                         int er = sy % 3;
                         for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                            int lum = LUM_AT(fb, fb_y, sx);
+                            int lum = LUM_AT(fb, sy, sx);
                             int val = lum + err_buf[er][sx];
                             int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                             int qe  = (val - out) >> 3;
@@ -1499,7 +1562,7 @@ static void core1() {
                     } else {
                         // --- Hard threshold region (HUD/status bar) ---
                         for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                            int lum = LUM_AT(fb, fb_y, sx);
+                            int lum = LUM_AT(fb, sy, sx);
                             if (lum > JTBD16_HUD_THRESHOLD) {
                                 frame[page * DISPLAYWIDTH + sx] |= (1 << bit);
                             }
@@ -1507,15 +1570,11 @@ static void core1() {
                     }
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1541,17 +1600,18 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_curr, 0, sizeof(err_curr));
                 memset(err_next, 0, sizeof(err_next));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_curr[sx + 1];
                         int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                         int qe  = val - out;
@@ -1571,15 +1631,11 @@ static void core1() {
                     memset(err_next, 0, sizeof(err_next));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1605,17 +1661,18 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_curr, 0, sizeof(err_curr));
                 memset(err_next, 0, sizeof(err_next));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_curr[sx + 1];
                         int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                         int qe  = val - out;
@@ -1634,15 +1691,11 @@ static void core1() {
                     memset(err_next, 0, sizeof(err_next));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1670,17 +1723,18 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_curr, 0, sizeof(err_curr));
                 memset(err_next, 0, sizeof(err_next));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_curr[sx + 1];
 
                         // Blue noise perturbation: shift threshold by ±BN_MODULATION/2
@@ -1706,15 +1760,11 @@ static void core1() {
                     memset(err_next, 0, sizeof(err_next));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1740,17 +1790,18 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_buf, 0, sizeof(err_buf));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
                     int er   = sy % 3;
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_buf[er][sx];
 
                         // Blue noise perturbation: shift threshold by ±BN_MODULATION/2
@@ -1782,15 +1833,11 @@ static void core1() {
                     memset(err_buf[er], 0, DISPLAYWIDTH * sizeof(int16_t));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1826,11 +1873,14 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
+
                 for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
                     for (int x = 0; x < DISPLAYWIDTH; x++) {
                         uint8_t col = 0;
                         for (int b = 0; b < 8; b++) {
-                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            int y = p * 8 + b;
                             uint lum = LUM_AT(fb, y, x);
                             col >>= 1;
                             if (lum > bayer4[y & 3][x & 3]) col |= 0x80;
@@ -1839,15 +1889,11 @@ static void core1() {
                     }
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1884,11 +1930,14 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
+
                 for (int p = 0; p < (DISPLAYHEIGHT / 8); p++) {
                     for (int x = 0; x < DISPLAYWIDTH; x++) {
                         uint8_t col = 0;
                         for (int b = 0; b < 8; b++) {
-                            int y = (DISPLAYHEIGHT - 1) - (p * 8 + b);
+                            int y = p * 8 + b;
                             uint lum = LUM_AT(fb, y, x);
                             col >>= 1;
                             if (lum > bayer8[y & 7][x & 7]) col |= 0x80;
@@ -1897,15 +1946,11 @@ static void core1() {
                     }
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -1932,19 +1977,20 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_curr, 0, sizeof(err_curr));
                 memset(err_next, 0, sizeof(err_next));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
                     int left_to_right = !(sy & 1);
 
                     if (left_to_right) {
                         for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
-                            int lum = LUM_AT(fb, fb_y, sx);
+                            int lum = LUM_AT(fb, sy, sx);
                             int val = lum + err_curr[sx + 1];
                             int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                             int qe  = val - out;
@@ -1961,7 +2007,7 @@ static void core1() {
                     } else {
                         // Right-to-left: mirror the FS kernel
                         for (int sx = DISPLAYWIDTH - 1; sx >= 0; sx--) {
-                            int lum = LUM_AT(fb, fb_y, sx);
+                            int lum = LUM_AT(fb, sy, sx);
                             int val = lum + err_curr[sx + 1];
                             int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                             int qe  = val - out;
@@ -1981,15 +2027,11 @@ static void core1() {
                     memset(err_next, 0, sizeof(err_next));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -2020,11 +2062,12 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_buf, 0, sizeof(err_buf));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
                     int r0   = sy % 3;
@@ -2033,7 +2076,7 @@ static void core1() {
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
                         int ex = sx + 2; // offset into err_buf (+2 for left kernel spread)
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_buf[r0][ex];
                         int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                         int qe  = val - out;
@@ -2063,15 +2106,11 @@ static void core1() {
                     memset(err_buf[r0], 0, (DISPLAYWIDTH + 4) * sizeof(int16_t));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 
@@ -2101,11 +2140,12 @@ static void core1() {
                 uint8_t last_fi = display_frame_index;
                 uint8_t *fb = frame_buffer[display_frame_index];
 
+                REBUILD_COMBINED_LUT();
+                BUILD_SMOOTH_LUM(fb);
                 memset(frame, 0, sizeof(frame));
                 memset(err_buf, 0, sizeof(err_buf));
 
                 for (int sy = 0; sy < DISPLAYHEIGHT; sy++) {
-                    int fb_y = (DISPLAYHEIGHT - 1) - sy;
                     int page = sy >> 3;
                     int bit  = sy & 7;
                     int r0   = sy % 3;
@@ -2114,7 +2154,7 @@ static void core1() {
 
                     for (int sx = 0; sx < DISPLAYWIDTH; sx++) {
                         int ex = sx + 2; // offset into err_buf
-                        int lum = LUM_AT(fb, fb_y, sx);
+                        int lum = LUM_AT(fb, sy, sx);
                         int val = lum + err_buf[r0][ex];
                         int out = (val > JTBD16_DITHER_THRESHOLD) ? 255 : 0;
                         int qe  = val - out;
@@ -2144,15 +2184,11 @@ static void core1() {
                     memset(err_buf[r0], 0, (DISPLAYWIDTH + 4) * sizeof(int16_t));
                 }
 
+                PACK_DMA_BUF(frame);
                 sem_release(&vsync);
 
                 do {
-                    gpio_put(J_OLED_CS, 0);
-                    gpio_put(J_OLED_DC, 0);
-                    oled_spi_write_blocking(command_park, sizeof(command_park));
-                    gpio_put(J_OLED_DC, 1);
-                    oled_spi_write_blocking(frame, sizeof(frame));
-                    gpio_put(J_OLED_CS, 1);
+                    DMA_SEND_FRAME();
                     __dmb();
                 } while (*(volatile uint8_t *)&display_frame_index == last_fi);
 

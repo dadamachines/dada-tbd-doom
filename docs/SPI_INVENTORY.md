@@ -271,7 +271,7 @@ gpio_pull_up(I2C_KBD_SDA);
   - Note: Available as alternative implementation if needed
 
 ### No PIO Claimed by OLED Currently
-The pinmap.md shows "OLED PIO_SPI" allocation, but actual code uses hardware SPI1. This appears to be **planning documentation** for refactoring OLED to PIO.
+The PINMAP.md shows "OLED PIO_SPI" allocation, but actual code uses hardware SPI1. This appears to be **planning documentation** for refactoring OLED to PIO.
 
 ---
 

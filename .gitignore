@@ -1,18 +1,39 @@
+# Build artifacts
 *.bak
 *.old
 *.tmp
-secrets*
-build/
 *.nogit
-~*
+*.uf2
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+build/
+
+# PlatformIO
+.pioenvs
+.pio
+
+# IDE / OS
 .idea
 .vscode
 .venv
-.esphome
+.DS_Store
+~*
+
+# Secrets
+secrets*
 secrets.*
-.pioenvs
-.pio
-.env.DS_Store
+
+# Media
 *.m4a
 *.wav
 tools/*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+.esphome

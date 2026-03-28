@@ -84,7 +84,7 @@ struct p4_spi_response2 {
 
 ## 3. STATE API (SpiAPI) — COMMAND TRANSPORT
 
-### Class SpiAPI Pinning (pinmap.md shows dual versions)
+### Class SpiAPI Pinning (PINMAP.md shows dual versions)
 ```cpp
 // REV_B (no RDY pin):
 DaDa_SPI cmd_api_spi {spi0, 33, 35, 32, 34, 30000000};

@@ -28,6 +28,7 @@ Doom runs entirely on the RP2350. Core 0 runs the game logic, core 1 handles dis
 | I2C SDA (UI board) | 38 | I2C1 |
 | I2C SCL (UI board) | 39 | I2C1 |
 | Debug UART TX | 20 | UART1 |
+| PSRAM CS (APS6404) | 19 | XIP_CS1 (QMI M[1]) |
 | Favorite button | 25 | GPIO (direct, no I2C) |
 
 **Verified via RP2350 register reads:** GPIO14 = SPI1_SCLK (funcsel 0x01), GPIO15 = SPI1_TX (funcsel 0x01), GPIO38 = I2C1_SDA (funcsel 0x03), GPIO39 = I2C1_SCL (funcsel 0x03). `TBD_SPI = spi1` is correct.
@@ -39,7 +40,7 @@ Doom runs entirely on the RP2350. Core 0 runs the game logic, core 1 handles dis
 ### Specifications
 - **Resolution:** 128×64 pixels, monochrome (1-bit per pixel)
 - **Controller:** SSD1309 (Solomon Systech)
-- **Interface:** SPI1 at 8 MHz
+- **Interface:** PIO SPI at 10 MHz (SSD1309 datasheet maximum)
 - **Physical size:** 2.4" diagonal — pixels are large and individually visible
 - **Framebuffer:** 1024 bytes (128 columns × 8 pages, MSB = bottom pixel in page)
 - **Addressing:** Horizontal addressing mode (0x20, 0x00)
@@ -196,7 +197,6 @@ upload_protocol = cmsis-dap
 ### Build Scripts
 
 - **`doom_build.py`** — Pre-build script that adds all rp2040-doom source files and include paths. Replaces the upstream CMake build. Also configures TinyUSB headers needed by pico_stdio (even though USB stdio is disabled).
-- **`append_wad_uf2.py`** — Post-build script that appends the WAD data.
 
 ### PlatformIO Conventions
 
@@ -376,51 +376,57 @@ This is 256 KB (0x40000) past `XIP_BASE`, leaving room for the firmware binary. 
 
 The `doom1.whx` file is a compressed Doom WAD variant produced by `whd_gen`. It uses a packed lump table where each `lumpinfo_t` is a single `uint32_t` (offset only). Valid magic bytes: `IWAD`, `IWHD`, or `IWHX`.
 
-#### Build-Time: How the WAD Gets Into Flash
+#### WAD Loading — SD Card to PSRAM
 
-The post-build script `append_wad_uf2.py` embeds the WAD into the firmware image:
+The WAD file is loaded from the SD card into PSRAM at boot by `sd_wad_loader.c`:
 
-1. Reads `data/doom1.whx` and validates the WAD magic bytes
-2. Chunks the WAD into 256-byte payloads, wraps each in a UF2 block
-3. Sets the target address of each block to `0x10040000` + offset
-4. Appends these blocks after the firmware UF2 blocks
-5. Fixes up block sequence numbers across the combined file
+1. Initializes PSRAM (8 MB APS6404 on QMI CS1)
+2. Mounts FAT filesystem via Petit FatFS on SPI0
+3. Opens `/DATA/DOOM1.WHX` and streams it into PSRAM at `0x11000000`
+4. Releases SPI0 pins for P4 link use
+5. Validates WAD magic bytes in PSRAM
 
-The result is a single UF2 file containing both firmware and WAD data. The CMSIS-DAP probe flashes each block to its target address.
+After loading, the WAD is accessed via direct memory-mapped pointers into PSRAM.
 
-#### Runtime: How the WAD is Read
-
-The WAD is accessed via direct memory-mapped pointers in `w_file_memory.c`:
-
-```c
-#define wad_map_base ((const uint8_t *)TINY_WAD_ADDR)  // 0x10040000
-```
-
-The WAD file interface (`W_Memory_Read`) uses `memcpy` from this pointer:
-
-```c
-memcpy(buffer, wad->mapped + offset, buffer_len);
-```
-
-Individual lumps are accessed even more directly via `w_wad.h`:
-
-```c
-static inline uint8_t *lump_data(const lumpinfo_t *lump) {
-    return whd_map_base + ((*lump) & 0xffffff);
-}
-```
-
-This returns a raw pointer into XIP flash — lumps are used in-place with zero copying.
+> **Historical note:** An earlier approach (`append_wad_uf2.py`) embedded the WAD into the firmware UF2 at flash address `0x10040000`. This was abandoned because UF2 drag-and-drop flashing of the combined image never worked reliably. See section 9 for the research log.
 
 #### Relevant Build Flags
 
 | Flag | Value | Purpose |
 |---|---|---|
-| `TINY_WAD_ADDR` | `0x10040000` | Flash address for WAD data |
-| `USE_MEMORY_WAD` | `1` | Enable memory-mapped WAD file interface |
+| `USE_SD_WAD` | `1` | Enable SD card WAD loading |
 | `USE_WHD` | `1` | Enable compressed WHD/WHX format support |
-| `USE_MEMMAP_ONLY` | `1` | Force all lump access through XIP pointers |
-| `PICO_FLASH_SIZE_BYTES` | `16777216` | 16 MB total flash size |
+| `USE_MEMMAP_ONLY` | `1` | Force all lump access through memory pointers |
+
+### PSRAM (APS6404, 8 MB, QPI on QMI CS1)
+
+The TBD-16 has an APS6404 8 MB PSRAM on GPIO19, accessed via the RP2350's QMI peripheral (CS1). After initialization, PSRAM is memory-mapped at `0x11000000` (XIP_BASE + 0x01000000) and is directly readable/writable as normal memory.
+
+The WAD file (~500 KB) is loaded from SD card into PSRAM at boot by `sd_wad_loader.c`.
+
+#### PSRAM Init — Critical RP2350 Gotchas
+
+`psram_init.c` is written with **zero SDK headers** (no `hardware/gpio.h`, `hardware/clocks.h`, etc.) because SDK headers pull in `stdbool.h` via `pico/types.h`, which causes the PSRAM init to hang on RP2350.
+
+Two RP2350-specific issues required careful handling:
+
+1. **Pad Isolation (ISO bit):** On RP2350 (unlike RP2040), every GPIO pad starts with `ISO=1` (bit 8 of `PADS_BANK0` register) after power-on reset. This electrically disconnects the pad. The SDK's `gpio_set_function()` clears ISO automatically, but with raw register access it must be done explicitly:
+   ```c
+   PAD_SET(pin) = PAD_IE;              // enable input
+   PAD_CLR(pin) = PAD_OD | PAD_ISO;    // enable output, remove isolation
+   ```
+
+2. **QMI M[1] Stale State:** The QMI peripheral is NOT reset by SYSRESETREQ (debug-probe reset). After a warm reset, M[1] retains its rfmt/rcmd/wfmt/wcmd from the previous boot. If GPIO19 is connected to XIP_CS1 while M[1] has valid config, QMI may immediately start a stale transaction that blocks M[0] (flash), freezing the CPU. Fix: clear M[1] registers **before** switching GPIO19 to `FUNC_XIP_CS1`.
+
+#### PSRAM Register Reference
+
+| Register | Address |
+|---|---|
+| QMI_BASE | `0x400d0000` |
+| PADS_BANK0_BASE | `0x40038000` |
+| GPIO19 pad reg | `0x40038050` (BASE + 0x04 + 19×4) |
+| GPIO19 IO_BANK0 CTRL | `0x4002809C` (BASE + 19×8 + 4) |
+| FUNC_XIP_CS1 | funcsel = 9 |
 
 ---
 
@@ -498,7 +504,6 @@ From analyzing the original TBD-16 firmware (`tbd-pico-seq3`):
 | `gen_all_luts.py` | Generate all 4 gamma LUT variants for the dithering framework |
 | `gen_gamma.py` | Generate gamma correction tables |
 | `gen_lut.py` | General LUT generation utilities |
-| `append_wad_uf2.py` | Post-build: re-stamps firmware blocks to ABSOLUTE family + appends WAD blocks |
 | `flash.sh` | Multi-mode flash script (debug probe / picotool / UF2) |
 | `split_uf2.py` | Split combined UF2 into firmware-only and WAD-only files |
 | `check_uf2.py` | Validate UF2 file structure |
@@ -508,9 +513,11 @@ From analyzing the original TBD-16 firmware (`tbd-pico-seq3`):
 
 ---
 
-## 9. UF2 Flashing Research & Status
+## 9. UF2 Flashing Research & Status (Historical)
 
-### Status: Drag-and-Drop Remains Unsolved
+> **Note:** This section documents the failed WAD-embed approach. The current firmware loads the WAD from SD card into PSRAM at boot, so UF2 only needs to contain the firmware (~500 KB). Plain BOOTSEL drag-and-drop works for firmware-only UF2 files.
+
+### Status: WAD-in-UF2 Drag-and-Drop Was Abandoned
 
 **TLDR:** Drag-and-drop flashing of the combined firmware+WAD UF2 via RP2350 BOOTSEL mass-storage mode **does not work** despite extensive investigation. The `cp` command to `/Volumes/RP2350/` always exits with code 1 and the device fails to boot.
 
@@ -633,13 +640,15 @@ Source: `~/.platformio/packages/framework-picosdk/src/common/boot_uf2_headers/in
 
 ### Current Build Pipeline
 
-The `append_wad_uf2.py` post-build script (current state — no partition table):
+The `append_wad_uf2.py` post-build script (removed — documented here for reference):
 
 1. PlatformIO builds `firmware.elf` → converts to `firmware.uf2` (family `RP2350_ARM_S`)
 2. Post-build reads `firmware.uf2`, re-stamps all firmware blocks to `ABSOLUTE_FAMILY_ID`
 3. Reads `data/doom1.whx`, creates WAD UF2 blocks at `TINY_WAD_ADDR` (`0x10040000`) with `ABSOLUTE_FAMILY_ID`
 4. Concatenates firmware + WAD blocks, fixes sequence numbers, writes combined `firmware.uf2`
 5. Result: ~8018 blocks, all `ABSOLUTE` family, addresses `0x10000000`–`0x101F7800`, ~4.1 MB
+
+> This approach was abandoned in favor of SD card WAD loading.
 
 ### Flashing Methods
 
@@ -715,7 +724,6 @@ Each UF2 block is exactly 512 bytes:
 
 | Script | Purpose |
 |---|---|
-| `append_wad_uf2.py` | Post-build: re-stamps firmware blocks to ABSOLUTE family + appends WAD blocks |
 | `flash.sh` | Multi-mode flash script (debug probe, picotool, UF2) |
 | `split_uf2.py` | Splits combined UF2 into firmware-only and WAD-only files |
 | `check_uf2.py` | Validates UF2 file structure and block integrity |
