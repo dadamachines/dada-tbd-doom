@@ -51,6 +51,11 @@ uint32_t pab_available(void);
 // or in the audio pipeline (ring buffer / resampler).
 void pab_set_test_tone(bool enable);
 
+// Set the source sample rate reported in PCM2 frames to the P4.
+// Default is PAB_SOURCE_FREQ (49716 Hz, Doom's OPL rate).
+// Projects running at 44100 Hz should call pab_set_source_rate(44100).
+void pab_set_source_rate(uint16_t rate);
+
 #ifdef __cplusplus
 }
 #endif

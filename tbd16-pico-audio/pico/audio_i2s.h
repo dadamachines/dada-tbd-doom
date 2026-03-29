@@ -5,8 +5,8 @@
 // ESP32-P4 codec.  This header provides the same types and functions
 // so projects like _core (zeptocore) compile and run without changes.
 //
-// The implementation lives in pico_audio_i2s_shim.c and routes all
-// audio through the PicoAudioBridge ring buffer → SPI → P4 codec.
+// The implementation lives in pico_audio_i2s_compat.c and routes all
+// audio through the TBD-16 audio driver → SPI → P4 codec.
 #pragma once
 
 #include "pico.h"
@@ -59,7 +59,7 @@ typedef struct audio_i2s_config {
 
 // ── Buffer pool ────────────────────────────────────────────────────────
 // Holds N pre-allocated audio buffers that cycle between producer and
-// the PAB ring buffer consumer.
+// the ring buffer consumer.
 
 #define AUDIO_I2S_POOL_MAX_BUFFERS 4
 
@@ -83,14 +83,14 @@ audio_buffer_pool_t *audio_new_producer_pool(
     uint32_t samples_per_buffer);
 
 // Configure I2S output.  On TBD-16 the pin/PIO fields are ignored;
-// the sample rate is forwarded to the P4 resampler.
+// the sample rate is forwarded to the audio transport.
 const audio_format_t *audio_i2s_setup(
     const audio_format_t *intended_audio_format,
     const audio_format_t *actual_audio_format,
     const audio_i2s_config_t *config);
 
 // Connect a producer pool to the output.  On TBD-16 this initialises
-// the PicoAudioBridge ring buffer.
+// the SPI audio transport and activates the P4 codec plugin.
 bool audio_i2s_connect(audio_buffer_pool_t *pool);
 
 // Enable or disable audio output.
@@ -101,8 +101,8 @@ void audio_i2s_set_enabled(bool enabled);
 //   block=false → return NULL immediately if none free
 audio_buffer_t *take_audio_buffer(audio_buffer_pool_t *pool, bool block);
 
-// Submit a filled buffer.  Copies samples into the PAB ring buffer
-// and marks the buffer as free for reuse.
+// Submit a filled buffer.  Copies samples into the ring buffer
+// for SPI transport and marks the buffer as free for reuse.
 void give_audio_buffer(audio_buffer_pool_t *pool, audio_buffer_t *buffer);
 
 #ifdef __cplusplus

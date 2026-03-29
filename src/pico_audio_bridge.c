@@ -22,6 +22,13 @@ static audio_buffer_t mix_buf;
 static bool test_tone_enabled = false;
 static uint32_t test_tone_phase = 0;
 
+// Source sample rate for PCM2 frames (default: Doom's OPL rate)
+static uint16_t pab_source_rate = PAB_SOURCE_FREQ;
+
+void pab_set_source_rate(uint16_t rate) {
+    pab_source_rate = rate;
+}
+
 // Phase step for 440 Hz at 44100 Hz with 32-bit accumulator, 256-entry table:
 // step = 440 * 2^32 / 44100 = 42852277
 #define TEST_TONE_PHASE_STEP 42852277u
@@ -92,7 +99,7 @@ void pab_give_buffer(audio_buffer_t *buf) {
 
     int16_t *src = (int16_t *)buf->buffer->bytes;
     uint32_t n = buf->sample_count;
-    if (n > MIX_BUF_SAMPLES) n = MIX_BUF_SAMPLES;
+    if (n > PAB_RING_SIZE - 1) n = PAB_RING_SIZE - 1;
 
     uint32_t w = ring_write;
     for (uint32_t i = 0; i < n; i++) {
@@ -142,7 +149,7 @@ uint32_t pab_pack_spi(uint8_t *synth_midi_buf, uint32_t buf_size) {
 #if AUDIO_TEST_TONES
     uint16_t rate16 = 44100;
 #else
-    uint16_t rate16 = (uint16_t)PAB_SOURCE_FREQ;
+    uint16_t rate16 = pab_source_rate;
 #endif
 
     // Cap samples per frame to match P4 codec consumption rate.
